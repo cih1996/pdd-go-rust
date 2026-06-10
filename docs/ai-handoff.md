@@ -426,6 +426,213 @@ Rust 版目前只做了:
 - 只有全部 SKU 成功，整个 submit 才是 `success`
 - 任意 SKU 失败，整个任务 submit 为 `failure`
 
+### 6.3.1 设备启动后的完整执行时序
+
+旧 Python 业务端实际执行链路不是“设备自己直接抢任务”，而是下面这套时序:
+
+1. 设备启动任务循环
+   - 某台设备点启动后，会启动一个 `_worker(device_id, mode)`
+   - worker 自己不直接向适配器取任务，而是优先从候选区拿
+2. 后端确保候选区预取循环存在
+   - `_ensure_prefetch_loop()` 会拉起 `_prefetch_tasks_loop()`
+   - 这个循环在后台持续并发向适配器抢任务
+3. 后端收集可用 fetch 候选
+   - 候选 = 启用的上游配置 + 启用的平台账号
+   - 如果某个上游有平台账号，则优先按账号粒度抢
+   - 如果某个上游没有账号，则回退用上游自身 token 或 mock token
+4. 候选轮转取任务
+   - 候选列表每轮会做轮转，避免总是同一个账号先抢
+   - 每个候选发给适配器的请求是:
+
+```json
+{
+  "device_id": null,
+  "source_code": "上游 code",
+  "token": "账号 token 或上游 token"
+}
+```
+
+5. 适配器返回统一任务结构
+   - 返回 `task_id`
+   - 返回 `upstream_task_ref`
+   - 返回 `task_items[]`
+   - 每个 `task_item` 至少包含:
+     - `goods_id`
+     - `sku_id`
+     - `step_index`
+6. 预取结果先进入候选区
+   - 不是立刻绑定到某台设备
+   - 会先做两层拦截:
+     - SKU 数超过系统限制，立即取消上游任务
+     - 业务键重复，立即取消上游任务
+   - 拦截通过后才入 `pending_task_queue`
+7. 空闲设备从候选区领任务
+   - worker 空闲时调用 `_take_pending_task()`
+   - 取到任务后才真正开始执行
+8. 多 SKU 顺序执行
+   - 一个任务里的 `task_items[]` 会按顺序逐个执行
+   - 每个 SKU 都会生成自己的跳转 URL
+   - 每个 SKU 会调用 `_run_task_until_terminal()`
+9. 单个 SKU 的识别循环
+   - 打开 URL
+   - 等待 `open_url_delay_seconds`
+   - 进入循环:
+     - 截图
+     - 识别账号风控
+     - 识别失败释放
+     - 识别点击图
+     - 识别成功图
+   - 没命中终态时 sleep 1 秒进入下一轮
+10. 单个 SKU 结束后的分支
+   - 命中成功图:
+     - 当前 SKU 成功
+     - 继续下一个 SKU
+   - 命中失败释放:
+     - 整个任务直接失败
+     - 不再跑后续 SKU
+   - 命中账号风控:
+     - 整个任务失败
+     - 当前设备停止后续任务循环
+11. 整个任务完成后统一 submit
+   - 如果全部 SKU 成功，则 `submit_type = success`
+   - 否则 `submit_type = failure`
+   - 成功时会先上传截图到适配器，换成 `capture_id`
+   - 再把所有 SKU 结果一次性 `submit-task`
+
+### 6.3.2 单个 SKU 的详细执行步骤
+
+1. 从 `task_item` 生成 URL
+2. 调 ADB 打开 URL
+3. 等页面稳定
+4. 开始第 N 轮截图
+5. 根据模板类型分组:
+   - `account_risk`
+   - `fail_release`
+   - `click_image`
+   - `success_image`
+6. 判断这一轮模板里是否存在 OCR 模板
+   - 有则初始化 `ocr_cache`
+   - 没有则 `ocr_cache = None`
+7. 扫描 `account_risk`
+   - 任何一个模板命中就立即结束当前 SKU
+   - detail.status = `failure`
+   - `should_stop = true`
+8. 扫描 `fail_release`
+   - 命中就结束当前 SKU
+   - detail.status = `failure`
+   - `should_stop = false`
+9. 扫描 `click_image`
+   - 命中后读取返回中心点
+   - ADB 点击
+   - 等待 `click_image_delay_seconds`
+   - 重新截图进入下一轮
+10. 扫描 `success_image`
+   - 命中则当前 SKU 成功
+   - detail.status = `success`
+11. 如果这一轮都未命中
+   - 记录 event log
+   - 继续下一轮
+
+### 6.3.3 找图 / OCR 的实际调用顺序
+
+每轮循环的真实顺序固定为:
+
+1. 截图一次
+2. 扫 `account_risk`
+3. 扫 `fail_release`
+4. 扫 `click_image`
+5. 扫 `success_image`
+
+每个阶段内部:
+
+- 按模板优先级和创建时间排序
+- 逐个模板执行 `_run_match()`
+- 一旦命中，当前阶段立即停止继续扫
+- 后续阶段是否继续取决于当前阶段结果
+
+所以“顺序”有两层:
+
+- 第一层是模板大类顺序固定
+- 第二层是同类模板内部按 priority/created_at 顺序
+
+### 6.3.4 OCR 与找图怎么混跑
+
+旧实现不是“先统一扫全部 OpenCV 再扫全部 OCR”，而是:
+
+- 仍然按模板顺序一个个走 `_run_match(template, image_bytes, ocr_cache)`
+- 但如果模板是 OCR:
+  - 使用同一轮缓存的 `ocr_cache["full_scan"]`
+- 如果模板是 OpenCV:
+  - 直接做模板匹配
+
+也就是说:
+
+- 调用顺序跟模板顺序一致
+- 但 OCR 结果在同一轮只计算一次
+- 所以能兼顾模板优先级和性能
+
+### 6.3.5 点击图的特殊规则
+
+- 点击图命中后，必须拿到中心点 `center`
+- 点击后不会立即判成功
+- 而是:
+  - 保存点击前截图
+  - 点击
+  - 等待
+  - 重新截图
+  - 再去跑下一轮终态识别
+- 如果最终成功:
+  - 提交时通常会保留两张图
+    - 点击前图
+    - 成功后图
+
+### 6.3.6 多 SKU submit 的详细规则
+
+- 每个 SKU 执行结束都会产出一个 `detail`
+- 但不会每个 SKU 单独 submit
+- 而是把所有已执行 SKU 聚合成 `item_results`
+- 任务结束后统一调用 `_submit_task_result()`
+
+成功 submit 时:
+
+1. 遍历每个 SKU 的 `detail.capture_urls`
+2. 对每张图调用适配器 `upload-capture`
+3. 拿到 `capture_id`
+4. 组装:
+
+```json
+{
+  "task_id": "xxx",
+  "type": "success",
+  "device_id": "xxx",
+  "message": "全部 SKU 识别完成",
+  "task_items": [
+    {
+      "goods_id": "xxx",
+      "sku_id": "xxx",
+      "recognition": "成功模板标签",
+      "message": "识别说明",
+      "capture_ids": ["..."]
+    }
+  ]
+}
+```
+
+失败 submit 时:
+
+- 不需要上传截图
+- 直接:
+
+```json
+{
+  "task_id": "xxx",
+  "type": "failure",
+  "device_id": "xxx",
+  "message": "失败原因",
+  "task_items": []
+}
+```
+
 ### 6.4 终态识别顺序
 
 每轮截图后的模板识别顺序固定:
