@@ -1,7 +1,287 @@
-export interface RuntimeSummary {
-  adapter_base_url: string
-  template_count: number
-  ocr_templates: number
-  opencv_templates: number
-  vision_mode: string
+export type TaskMode = 'mock' | 'live'
+export type TemplateType = 'account_risk' | 'fail_release' | 'success_image' | 'click_image'
+export type RecognitionEngine = 'opencv' | 'ocr'
+
+export interface DeviceStats {
+  total: number
+  success: number
+  failure: number
+}
+
+export interface TaskProgress {
+  task_id: string
+  task_mode: string
+  started_at: string
+  loop_count: number
+  current_stage: string
+  current_message: string
+  last_matched_template?: string | null
+  click_capture_url?: string | null
+}
+
+export interface DeviceInfo {
+  serial: string
+  status: string
+  connected: boolean
+  running: boolean
+  stats: DeviceStats
+  current_task?: TaskProgress | null
+}
+
+export interface CropRegion {
+  x: number
+  y: number
+  width?: number | null
+  height?: number | null
+}
+
+export interface DebugCaptureResult {
+  device_id: string
+  capture_url: string
+}
+
+export interface TemplateRecord {
+  id: string
+  label: string
+  template_type: TemplateType
+  recognition_engine: RecognitionEngine
+  priority: number
+  expected_text?: string | null
+  image_name?: string | null
+  image_url?: string | null
+  threshold: number
+  method: 'ccoeff_normed' | 'ccorr_normed' | 'sqdiff_normed'
+  grayscale: boolean
+  crop?: CropRegion | null
+  enabled: boolean
+  created_at: string
+}
+
+export interface DetailRecord {
+  id: string
+  timestamp: string
+  task_id: string
+  upstream_task_ref?: string | null
+  task_mode: string
+  device_id: string
+  url?: string | null
+  status: string
+  recognition: string
+  image_count: number
+  capture_url?: string | null
+  capture_urls?: string[]
+  message?: string | null
+  template_id?: string | null
+  template_label?: string | null
+}
+
+export interface TaskEvent {
+  id: string
+  timestamp: string
+  device_id?: string | null
+  level: 'info' | 'warning' | 'error'
+  message: string
+  payload: Record<string, unknown>
+}
+
+export interface DashboardSummary {
+  total: number
+  success: number
+  failure: number
+}
+
+export interface PendingTaskRecord {
+  task_id: string
+  upstream_task_ref?: string | null
+  source_code?: string | null
+  source_name?: string | null
+  account_id?: string | null
+  account_name?: string | null
+  item_count: number
+  prefetched_at?: string | null
+}
+
+export interface AdapterSubmitLogRecord {
+  id: string
+  timestamp: string
+  action: string
+  request_method: string
+  endpoint: string
+  task_id?: string | null
+  upstream_task_ref?: string | null
+  source_code?: string | null
+  device_id?: string | null
+  submit_type?: string | null
+  request_payload?: unknown
+  response_status?: number | null
+  response_payload?: unknown
+  error?: string | null
+}
+
+export interface UrlTemplateRecord {
+  id: string
+  template: string
+  trigger_count: number
+  success_count: number
+  risk_count: number
+}
+
+export interface SystemConfig {
+  open_url_delay_seconds: number
+  click_image_delay_seconds: number
+  max_task_sku_count: number
+  use_url_templates: boolean
+  url_templates: UrlTemplateRecord[]
+}
+
+export interface PlatformAccountStats {
+  fetched_count: number
+  reported_success_count: number
+  reported_failure_count: number
+}
+
+export interface PlatformAccountRecord {
+  id: string
+  name: string
+  upstream_code: string
+  upstream_type: string
+  enabled: boolean
+  notes?: string | null
+  created_at: string
+  stats: PlatformAccountStats
+  bound_device_ids: string[]
+}
+
+export interface UpstreamOption {
+  code: string
+  name: string
+  upstream_type: string
+  enabled: boolean
+}
+
+export interface UpstreamConfigStats {
+  fetched_count: number
+  reported_success_count: number
+  reported_failure_count: number
+}
+
+export interface UpstreamConfigRecord {
+  id: string
+  name: string
+  code: string
+  upstream_type: 'mock_upstream' | 'laoqian_worker' | 'custom_http'
+  enabled: boolean
+  priority: number
+  base_url: string
+  fetch_path?: string | null
+  report_success_path?: string | null
+  report_failure_path?: string | null
+  token?: string | null
+  headers: Record<string, string>
+  notes?: string | null
+  created_at: string
+  stats: UpstreamConfigStats
+}
+
+export interface ServiceLinkStatus {
+  key: string
+  name: string
+  url: string
+  healthy: boolean
+  message?: string | null
+}
+
+export interface DesktopUpdateStatus {
+  manifest_url: string
+  app_version: string
+  current_version: string
+  current_source: 'bundled' | 'updated'
+  pending_version?: string | null
+  update_ready: boolean
+  checking: boolean
+  last_checked_at?: string | null
+  last_error?: string | null
+}
+
+export interface DashboardState {
+  devices: DeviceInfo[]
+  templates: TemplateRecord[]
+  details: DetailRecord[]
+  summary: DashboardSummary
+  event_log: TaskEvent[]
+  pending_tasks: PendingTaskRecord[]
+  adapter_submit_logs: AdapterSubmitLogRecord[]
+  system_config: SystemConfig
+  upstream_configs: UpstreamConfigRecord[]
+  platform_accounts: PlatformAccountRecord[]
+  upstream_options: UpstreamOption[]
+  service_links: ServiceLinkStatus[]
+}
+
+export interface DebugResult {
+  task_id: string
+  matched: boolean
+  should_stop: boolean
+  detail: DetailRecord
+  opencv_results: DebugTemplateResult[]
+  timing?: DebugTimingSummary
+}
+
+export interface DebugTemplateResult {
+  template_id: string
+  template_label: string
+  template_type: TemplateType
+  recognition_engine: RecognitionEngine
+  loop_count: number
+  stage_name: string
+  request_elapsed_ms: number
+  ocr_result?: {
+    matched_text?: string
+    full_text?: string
+    expected_tokens?: string[]
+    results?: Array<{
+      text: string
+      confidence: number
+      bounding_box?: Array<[number, number]> | number[][]
+    }>
+  } | null
+  match: {
+    found: boolean
+    confidence: number
+    elapsed_ms: number
+    threshold: number
+    method: 'ccoeff_normed' | 'ccorr_normed' | 'sqdiff_normed' | 'ocr'
+    top_left?: [number, number] | null
+    center?: [number, number] | null
+    width?: number | null
+    height?: number | null
+    search_region?: [number, number, number, number] | null
+    matched_text?: string | null
+    full_text?: string | null
+    candidate_texts?: string[]
+  }
+}
+
+export interface DebugTimingSummary {
+  total_elapsed_ms: number
+  open_url_elapsed_ms?: number | null
+  capture_steps: {
+    loop_count: number
+    elapsed_ms: number
+  }[]
+}
+
+export interface TemplateTestResult {
+  template: TemplateRecord
+  match: DebugTemplateResult['match']
+  capture_url: string
+  recognition_engine: RecognitionEngine
+  ocr_result?: DebugTemplateResult['ocr_result']
+}
+
+export interface DebugSelectionTestResult {
+  recognition_engine?: RecognitionEngine
+  match: DebugTemplateResult['match']
+  search_crop?: CropRegion | null
+  ocr_result?: DebugTemplateResult['ocr_result']
 }

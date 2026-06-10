@@ -18,7 +18,7 @@ echo - Vue frontend:  http://127.0.0.1:5173
 echo.
 
 start "adapter-rs" cmd /k ""%ROOT%\start-adapter.bat""
-start "unified-server" cmd /k ""%ROOT%\start-unified-server.bat""
+start "unified-server" cmd /k ""%ROOT%\restart-unified-server.bat""
 start "frontend" cmd /k ""%ROOT%\start-frontend.bat""
 
 echo Opened 3 windows.

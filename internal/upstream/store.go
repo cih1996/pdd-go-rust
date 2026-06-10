@@ -1,11 +1,12 @@
 package upstream
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 type Record struct {
@@ -16,8 +17,10 @@ type Record struct {
 	Enabled      bool      `json:"enabled"`
 	Priority     int       `json:"priority"`
 	BaseURL      string    `json:"base_url"`
+	Token        string    `json:"token,omitempty"`
 	Notes        string    `json:"notes,omitempty"`
 	CreatedAt    time.Time `json:"created_at"`
+	Stats        Stats     `json:"stats"`
 }
 
 type UpsertRequest struct {
@@ -27,7 +30,14 @@ type UpsertRequest struct {
 	Enabled      *bool  `json:"enabled"`
 	Priority     *int   `json:"priority"`
 	BaseURL      string `json:"base_url"`
+	Token        string `json:"token"`
 	Notes        string `json:"notes"`
+}
+
+type Stats struct {
+	FetchedCount         int `json:"fetched_count"`
+	ReportedSuccessCount int `json:"reported_success_count"`
+	ReportedFailureCount int `json:"reported_failure_count"`
 }
 
 type Store struct {
@@ -39,7 +49,7 @@ func NewStore() *Store {
 	return &Store{
 		items: []Record{
 			{
-				ID:           uuid.NewString(),
+				ID:           newID(),
 				Name:         "本地模拟上游",
 				Code:         "mock_local",
 				UpstreamType: "mock_upstream",
@@ -48,9 +58,10 @@ func NewStore() *Store {
 				BaseURL:      "http://127.0.0.1:8091",
 				Notes:        "默认联调 Rust 适配器中的本地模拟 provider",
 				CreatedAt:    time.Now().UTC(),
+				Stats:        Stats{},
 			},
 			{
-				ID:           uuid.NewString(),
+				ID:           newID(),
 				Name:         "老钱真实上游",
 				Code:         "laoqian_worker",
 				UpstreamType: "laoqian_worker",
@@ -59,6 +70,7 @@ func NewStore() *Store {
 				BaseURL:      "http://127.0.0.1:8091",
 				Notes:        "默认联调 Rust 适配器中的老钱 provider",
 				CreatedAt:    time.Now().UTC(),
+				Stats:        Stats{},
 			},
 		},
 	}
@@ -92,7 +104,7 @@ func (s *Store) Create(payload UpsertRequest) Record {
 	}
 	code := strings.TrimSpace(payload.Code)
 	if code == "" {
-		code = upstreamType + "_" + strings.ReplaceAll(uuid.NewString()[:8], "-", "")
+		code = upstreamType + "_" + shortID()
 	}
 	baseURL := strings.TrimSpace(payload.BaseURL)
 	if baseURL == "" {
@@ -107,18 +119,83 @@ func (s *Store) Create(payload UpsertRequest) Record {
 		priority = *payload.Priority
 	}
 	record := Record{
-		ID:           uuid.NewString(),
+		ID:           newID(),
 		Name:         name,
 		Code:         code,
 		UpstreamType: upstreamType,
 		Enabled:      enabled,
 		Priority:     priority,
 		BaseURL:      baseURL,
+		Token:        strings.TrimSpace(payload.Token),
 		Notes:        strings.TrimSpace(payload.Notes),
 		CreatedAt:    time.Now().UTC(),
+		Stats:        Stats{},
 	}
 	s.items = append(s.items, record)
 	return record
+}
+
+func (s *Store) Update(id string, payload UpsertRequest) (Record, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for index, item := range s.items {
+		if item.ID != id {
+			continue
+		}
+		updated := item
+		if name := strings.TrimSpace(payload.Name); name != "" {
+			updated.Name = name
+		}
+		if upstreamType := strings.TrimSpace(payload.UpstreamType); upstreamType != "" {
+			updated.UpstreamType = upstreamType
+		}
+		if payload.Enabled != nil {
+			updated.Enabled = *payload.Enabled
+		}
+		if payload.Priority != nil {
+			updated.Priority = *payload.Priority
+		}
+		if baseURL := strings.TrimSpace(payload.BaseURL); baseURL != "" {
+			updated.BaseURL = baseURL
+		}
+		updated.Token = strings.TrimSpace(payload.Token)
+		updated.Notes = strings.TrimSpace(payload.Notes)
+		s.items[index] = updated
+		return updated, true
+	}
+
+	return Record{}, false
+}
+
+func (s *Store) Toggle(id string, enabled bool) (Record, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for index, item := range s.items {
+		if item.ID != id {
+			continue
+		}
+		s.items[index].Enabled = enabled
+		return s.items[index], true
+	}
+
+	return Record{}, false
+}
+
+func (s *Store) Delete(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for index, item := range s.items {
+		if item.ID != id {
+			continue
+		}
+		s.items = append(s.items[:index], s.items[index+1:]...)
+		return true
+	}
+
+	return false
 }
 
 func defaultNameForType(upstreamType string) string {
@@ -130,4 +207,16 @@ func defaultNameForType(upstreamType string) string {
 	default:
 		return "本地模拟上游"
 	}
+}
+
+func newID() string {
+	return fmt.Sprintf("%d_%s", time.Now().UTC().UnixNano(), shortID())
+}
+
+func shortID() string {
+	buf := make([]byte, 4)
+	if _, err := rand.Read(buf); err != nil {
+		return fmt.Sprintf("%08x", time.Now().UTC().UnixNano())
+	}
+	return hex.EncodeToString(buf)
 }

@@ -14,7 +14,7 @@ type Config struct {
 func Load() Config {
     return Config{
         HTTPAddr:         getenv("UNIFIED_HTTP_ADDR", ":8080"),
-        FrontendDistDir:  getenv("FRONTEND_DIST_DIR", "./web/dist"),
+        FrontendDistDir:  getenv("FRONTEND_DIST_DIR", "./frontend/dist"),
         AdapterBaseURL:   getenv("ADAPTER_BASE_URL", "http://127.0.0.1:8091"),
         OCRModelDir:      getenv("OCR_MODEL_DIR", "./assets/ocr"),
         OpenCVAssetDir:   getenv("OPENCV_ASSET_DIR", "./assets/opencv"),

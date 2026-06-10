@@ -24,6 +24,20 @@ if errorlevel 1 (
     exit /b 1
 )
 
+where link >nul 2>nul
+if errorlevel 1 (
+    echo.
+    echo [adapter-rs] MSVC linker link.exe was not found.
+    echo [adapter-rs] install Visual Studio Build Tools with Desktop development with C++.
+    echo [adapter-rs] or run this script from x64 Native Tools Command Prompt for VS.
+    echo [adapter-rs] download:
+    echo https://visualstudio.microsoft.com/visual-cpp-build-tools/
+    echo.
+    popd
+    pause
+    exit /b 1
+)
+
 echo [adapter-rs] starting on http://127.0.0.1:8091
 echo.
 cargo run
