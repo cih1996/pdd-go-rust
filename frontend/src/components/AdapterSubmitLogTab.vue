@@ -73,28 +73,26 @@ const filteredLogs = computed(() => {
 </script>
 
 <template>
-  <el-card shadow="never" class="submit-log-page">
-    <template #header>
-      <div class="flex-between">
-        <div class="submit-log-header">
-          <span class="submit-log-title">适配器完整交互日志</span>
-          <el-tag size="small" type="info">{{ props.logs.length }} 条</el-tag>
-        </div>
-        <div class="submit-log-actions">
-          <el-input
-            v-model="keyword"
-            placeholder="筛选动作 / task_id / body / 响应"
-            :prefix-icon="Search"
-            style="width: 260px"
-            clearable
-          />
-          <el-button type="primary" plain :icon="Refresh" @click="emit('refresh')">刷新</el-button>
-        </div>
+  <div class="submit-log-page">
+    <div class="flex-between mb-4">
+      <div class="submit-log-header">
+        <span class="submit-log-title">适配器完整交互日志</span>
+        <el-tag size="small" type="info" effect="light" round>{{ props.logs.length }} 条记录</el-tag>
       </div>
-    </template>
+      <div class="submit-log-actions">
+        <el-input
+          v-model="keyword"
+          placeholder="筛选动作 / task_id / body / 响应"
+          :prefix-icon="Search"
+          style="width: 260px"
+          clearable
+        />
+        <el-button type="primary" plain :icon="Refresh" @click="emit('refresh')">刷新</el-button>
+      </div>
+    </div>
 
     <div class="submit-log-wrapper">
-      <el-empty v-if="filteredLogs.length === 0" description="暂无适配器交互日志" :image-size="72" />
+      <el-empty v-if="filteredLogs.length === 0" description="暂无适配器交互日志" :image-size="80" />
       <div v-else class="submit-log-list">
         <div
           v-for="item in filteredLogs"
@@ -105,56 +103,90 @@ const filteredLogs = computed(() => {
         >
           <div class="submit-log-summary">
             <div class="submit-log-summary-left">
-              <el-tag :type="actionTagType(item.action)" size="small">{{ item.action }}</el-tag>
-              <el-tag v-if="item.submit_type" :type="submitTypeTagType(item.submit_type)" size="small">{{ item.submit_type }}</el-tag>
+              <el-tag :type="actionTagType(item.action)" size="small" effect="light">{{ item.action }}</el-tag>
+              <el-tag v-if="item.submit_type" :type="submitTypeTagType(item.submit_type)" size="small" effect="plain">{{ item.submit_type }}</el-tag>
               <span class="truncate submit-log-task-id" :title="item.task_id || '-'">{{ item.task_id || '-' }}</span>
             </div>
-            <el-tag :type="responseStatusTagType(item.response_status, item.error)" size="small">
+            <el-tag :type="responseStatusTagType(item.response_status, item.error)" size="small" effect="dark">
               {{ item.response_status ?? (item.error ? 'ERROR' : 'PENDING') }}
             </el-tag>
           </div>
 
           <div class="submit-log-meta">
-            <span>时间：{{ formatDateTime(item.timestamp) }}</span>
-            <span>方法：{{ item.request_method }}</span>
-            <span>来源：{{ item.source_code || '-' }}</span>
-            <span>设备：{{ item.device_id || '-' }}</span>
-            <span>上游任务号：{{ item.upstream_task_ref || '-' }}</span>
+            <span><i class="meta-icon">🕒</i> {{ formatDateTime(item.timestamp) }}</span>
+            <span><i class="meta-icon">⚡</i> {{ item.request_method }}</span>
+            <span><i class="meta-icon">🌐</i> {{ item.source_code || '-' }}</span>
+            <span><i class="meta-icon">📱</i> {{ item.device_id || '-' }}</span>
+            <span><i class="meta-icon">🔖</i> {{ item.upstream_task_ref || '-' }}</span>
           </div>
 
-          <div v-if="expandedLogId === item.id" class="submit-log-detail">
-            <div class="submit-log-detail-line"><strong>动作：</strong>{{ item.action }}</div>
-            <div class="submit-log-detail-line"><strong>接口：</strong>{{ item.endpoint }}</div>
-            <div class="submit-log-detail-line"><strong>错误：</strong>{{ item.error || '-' }}</div>
-            <div class="submit-log-block">
-              <div class="submit-log-block-title">POST Body</div>
-              <pre class="submit-log-payload">{{ formatAnyPayload(item.request_payload) }}</pre>
+          <div v-if="expandedLogId === item.id" class="submit-log-detail" @click.stop>
+            <div class="detail-grid">
+              <div class="detail-grid-item">
+                <span class="detail-label">动作：</span>
+                <span class="detail-value">{{ item.action }}</span>
+              </div>
+              <div class="detail-grid-item">
+                <span class="detail-label">接口：</span>
+                <span class="detail-value">{{ item.endpoint }}</span>
+              </div>
+              <div class="detail-grid-item" v-if="item.error">
+                <span class="detail-label">错误：</span>
+                <span class="detail-value text-red">{{ item.error }}</span>
+              </div>
             </div>
-            <div class="submit-log-block">
-              <div class="submit-log-block-title">Response</div>
-              <pre class="submit-log-payload">{{ formatAnyPayload(item.response_payload) || '-' }}</pre>
-            </div>
+
+            <el-row :gutter="16" class="mt-4">
+              <el-col :span="12">
+                <div class="submit-log-block">
+                  <div class="submit-log-block-title">Request Payload</div>
+                  <pre class="submit-log-payload">{{ formatAnyPayload(item.request_payload) }}</pre>
+                </div>
+              </el-col>
+              <el-col :span="12">
+                <div class="submit-log-block">
+                  <div class="submit-log-block-title">Response Data</div>
+                  <pre class="submit-log-payload">{{ formatAnyPayload(item.response_payload) || '-' }}</pre>
+                </div>
+              </el-col>
+            </el-row>
           </div>
         </div>
       </div>
     </div>
-  </el-card>
+  </div>
 </template>
 
 <style scoped>
-.submit-log-page :deep(.el-card__body) {
-  padding: 0;
+.submit-log-page {
+  display: flex;
+  flex-direction: column;
+}
+
+.flex-between {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.mb-4 {
+  margin-bottom: 16px;
+}
+
+.mt-4 {
+  margin-top: 16px;
 }
 
 .submit-log-header {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 12px;
 }
 
 .submit-log-title {
   font-size: 16px;
-  font-weight: 500;
+  font-weight: 600;
+  color: #1f2937;
 }
 
 .submit-log-actions {
@@ -164,11 +196,12 @@ const filteredLogs = computed(() => {
 }
 
 .submit-log-wrapper {
-  min-height: calc(100vh - 240px);
-  max-height: calc(100vh - 240px);
+  max-height: 600px;
   overflow-y: auto;
   padding: 16px;
-  background: #f8f9fa;
+  background: #f8fafc;
+  border-radius: 8px;
+  border: 1px solid #e2e8f0;
 }
 
 .submit-log-list {
@@ -178,22 +211,24 @@ const filteredLogs = computed(() => {
 }
 
 .submit-log-item {
-  border: 1px solid #ebeef5;
-  border-radius: 10px;
-  background: #fff;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #ffffff;
   padding: 14px 16px;
   cursor: pointer;
-  transition: background-color 0.2s, border-color 0.2s;
+  transition: all 0.2s ease;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.02);
 }
 
 .submit-log-item:hover {
-  background: #f4f6f8;
-  border-color: #dcdfe6;
+  border-color: #cbd5e1;
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
 }
 
 .submit-log-item-expanded {
-  border-color: #c6e2ff;
-  background: #f8fbff;
+  border-color: #93c5fd;
+  box-shadow: 0 4px 12px -2px rgba(0, 0, 0, 0.08);
+  cursor: default;
 }
 
 .submit-log-summary {
@@ -212,54 +247,106 @@ const filteredLogs = computed(() => {
 
 .submit-log-task-id {
   font-size: 13px;
-  color: #303133;
+  color: #334155;
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;
 }
 
 .submit-log-meta {
   display: flex;
   flex-wrap: wrap;
-  gap: 12px 18px;
-  margin-top: 8px;
+  gap: 12px 20px;
+  margin-top: 10px;
   font-size: 12px;
-  color: #909399;
+  color: #64748b;
+}
+
+.meta-icon {
+  font-style: normal;
+  opacity: 0.7;
+  margin-right: 2px;
 }
 
 .submit-log-detail {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  margin-top: 12px;
-  padding-top: 12px;
-  border-top: 1px dashed #dcdfe6;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px dashed #e2e8f0;
 }
 
-.submit-log-detail-line {
+.detail-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 12px;
+  background: #f8fafc;
+  padding: 12px;
+  border-radius: 6px;
+}
+
+.detail-grid-item {
+  display: flex;
+  align-items: flex-start;
   font-size: 13px;
-  color: #606266;
+}
+
+.detail-label {
+  color: #64748b;
+  min-width: 48px;
+}
+
+.detail-value {
+  color: #334155;
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;
+  word-break: break-all;
+}
+
+.text-red {
+  color: #ef4444;
 }
 
 .submit-log-block {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
+  height: 100%;
 }
 
 .submit-log-block-title {
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 600;
-  color: #606266;
+  color: #475569;
 }
 
 .submit-log-payload {
   margin: 0;
   padding: 12px;
-  border-radius: 8px;
-  background: #1f2937;
-  color: #e5e7eb;
+  border-radius: 6px;
+  background: #1e293b;
+  color: #f8fafc;
   font-size: 12px;
-  line-height: 1.6;
+  line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-all;
+  max-height: 300px;
+  overflow-y: auto;
+  flex: 1;
+}
+
+/* Custom Scrollbar for payload */
+.submit-log-payload::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.submit-log-payload::-webkit-scrollbar-track {
+  background: #0f172a;
+  border-radius: 3px;
+}
+.submit-log-payload::-webkit-scrollbar-thumb {
+  background: #475569;
+  border-radius: 3px;
+}
+.submit-log-payload::-webkit-scrollbar-thumb:hover {
+  background: #64748b;
 }
 
 .truncate {

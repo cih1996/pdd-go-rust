@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import type { DeviceInfo, PendingTaskRecord, TaskEvent } from '../types'
-import { Monitor, Refresh, VideoPlay, VideoPause, Connection, Search, Clock } from '@element-plus/icons-vue'
-import { formatApiDateTime, parseApiDate } from '../utils/datetime'
+import type { AdapterSubmitLogRecord, DetailRecord, DeviceInfo, PendingTaskRecord, TaskEvent } from '../types'
+import { parseApiDate } from '../utils/datetime'
 
 const props = defineProps<{
   devices: DeviceInfo[]
   eventLog: TaskEvent[]
+  details: DetailRecord[]
+  adapterSubmitLogs: AdapterSubmitLogRecord[]
   pendingTasks: PendingTaskRecord[]
   selectedDevices: string[]
   selectedAllRunning: boolean
@@ -79,12 +80,21 @@ interface TerminalTaskLogItem {
   level: TaskEvent['level']
   task_id: string
   upstream_task_ref: string
-  report_result: string
-  recognition_type: string
-  recognition_content: string
+  recognition_result: string
+  recognition_text: string
   message: string
   source_code: string
+  goods_id: string
+  sku_id: string
   report_payload?: Record<string, unknown> | null
+  submit_status: string
+  request_payload?: unknown
+  response_payload?: unknown
+  response_status?: number | null
+  endpoint?: string | null
+  submit_type?: string | null
+  action?: string | null
+  error?: string | null
 }
 
 function toTerminalTaskLog(event: TaskEvent): TerminalTaskLogItem | null {
@@ -97,31 +107,115 @@ function toTerminalTaskLog(event: TaskEvent): TerminalTaskLogItem | null {
     level: event.level,
     task_id: String(payload.task_id ?? ''),
     upstream_task_ref: String(payload.upstream_task_ref ?? ''),
-    report_result: String(payload.report_result ?? '-'),
-    recognition_type: String(payload.recognition_type ?? '-'),
-    recognition_content: String(payload.recognition_content ?? '-'),
+    recognition_result: String(payload.recognition_type ?? '-'),
+    recognition_text: String(payload.recognition_content ?? '-'),
     message: String(payload.message ?? ''),
     source_code: String(payload.source_code ?? ''),
+    goods_id: String(payload.goods_id ?? ''),
+    sku_id: String(payload.sku_id ?? ''),
     report_payload:
       payload.report_payload && typeof payload.report_payload === 'object'
         ? (payload.report_payload as Record<string, unknown>)
         : null,
+    submit_status: '未提交',
   }
 }
 
+function formatRecognitionResult(detail: DetailRecord) {
+  const mapping: Record<string, string> = {
+    success_image: '成功',
+    fail_release: '失败释放',
+    account_risk: '账号风控',
+    open_url_failed: '异常停止',
+    loop_failed: '异常停止',
+  }
+  return mapping[detail.recognition] || (detail.status === 'success' ? '成功' : detail.status === 'failure' ? '失败' : detail.recognition || '-')
+}
+
+function formatRecognitionText(detail: DetailRecord) {
+  return detail.template_label || detail.message || detail.recognition || '-'
+}
+
+function toTerminalTaskLogFromDetail(detail: DetailRecord): TerminalTaskLogItem {
+  return {
+    id: detail.id,
+    timestamp: detail.timestamp,
+    device_id: detail.device_id,
+    level: detail.status === 'success' ? 'info' : 'warning',
+    task_id: detail.task_id,
+    upstream_task_ref: detail.upstream_task_ref || '',
+    recognition_result: formatRecognitionResult(detail),
+    recognition_text: formatRecognitionText(detail),
+    message: detail.message || '',
+    source_code: '',
+    goods_id: detail.goods_id || '',
+    sku_id: detail.sku_id || '',
+    report_payload: null,
+    submit_status: '未提交',
+  }
+}
+
+function adapterSubmitStatus(item: AdapterSubmitLogRecord) {
+  if (item.error) return '提交失败'
+  if ((item.response_status ?? 0) >= 400) return '提交失败'
+  if (item.response_status && item.response_status >= 200) return '提交成功'
+  return '提交中'
+}
+
+function buildSubmitLogKey(taskId?: string | null, upstreamTaskRef?: string | null, deviceId?: string | null) {
+  return [taskId || '', upstreamTaskRef || '', deviceId || ''].join('::')
+}
+
 const filteredLogs = computed(() => {
-  const base = props.eventLog.map(toTerminalTaskLog).filter((item): item is TerminalTaskLogItem => Boolean(item))
+  const submitLogMap = new Map<string, AdapterSubmitLogRecord>()
+  props.adapterSubmitLogs
+    .filter((item) => item.action === 'submit-task')
+    .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+    .forEach((item) => {
+      const key = buildSubmitLogKey(item.task_id, item.upstream_task_ref, item.device_id)
+      if (!submitLogMap.has(key)) {
+        submitLogMap.set(key, item)
+      }
+    })
+  const detailBase = props.details.map(toTerminalTaskLogFromDetail)
+  const eventBase = props.eventLog
+    .map(toTerminalTaskLog)
+    .filter((item): item is TerminalTaskLogItem => Boolean(item))
+  const base = (detailBase.length > 0 ? detailBase : eventBase)
+    .map((item) => {
+      const submitLog = submitLogMap.get(buildSubmitLogKey(item.task_id, item.upstream_task_ref, item.device_id))
+      if (!submitLog) return item
+      return {
+        ...item,
+        submit_status: adapterSubmitStatus(submitLog),
+        request_payload: submitLog.request_payload,
+        response_payload: submitLog.response_payload,
+        response_status: submitLog.response_status,
+        endpoint: submitLog.endpoint,
+        submit_type: submitLog.submit_type,
+        action: submitLog.action,
+        error: submitLog.error,
+      }
+    })
+    .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
   if (!searchLog.value) return base
   const keyword = searchLog.value.trim()
   return base.filter((item) =>
     [
-      item.report_result,
-      item.recognition_type,
-      item.recognition_content,
+      item.recognition_result,
+      item.recognition_text,
+      item.submit_status,
+      item.source_code,
+      item.goods_id,
+      item.sku_id,
       item.device_id,
       item.task_id,
       item.upstream_task_ref,
       item.message,
+      item.endpoint,
+      item.submit_type,
+      String(item.response_status ?? ''),
+      item.error,
     ].some((value) => value?.includes(keyword)),
   )
 })
@@ -161,8 +255,11 @@ function formatDuration(startedAt?: string) {
   return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
 }
 
-function formatDateTime(value?: string | null) {
-  return formatApiDateTime(value)
+function queueStatusLabel(status?: string | null) {
+  if (status === 'active') return '处理中'
+  if (status === 'completed') return '已完成'
+  if (status === 'released') return '已释放'
+  return '候选中'
 }
 
 function formatLogPayload(payload?: Record<string, unknown> | null) {
@@ -174,19 +271,18 @@ function toggleLogExpand(logId: string) {
   expandedLogId.value = expandedLogId.value === logId ? '' : logId
 }
 
-function reportTagType(result: string) {
-  return result === '上报成功' ? 'success' : result === '上报失败' ? 'danger' : 'info'
+function recognitionTagClass(resultType: string) {
+  if (resultType === '成功') return 'tag-success'
+  if (resultType === '失败释放' || resultType === '异常停止') return 'tag-danger'
+  if (resultType === '账号风控' || resultType === '账号风控停机' || resultType === '服务中断') return 'tag-warning'
+  return 'tag-info'
 }
 
-function recognitionTagType(resultType: string) {
-  if (resultType === '成功') return 'success'
-  if (resultType === '失败释放') return 'danger'
-  if (resultType === '账号风控') return 'warning'
-  if (resultType === '账号风控停机') return 'warning'
-  if (resultType === '手动停止') return 'info'
-  if (resultType === '服务中断') return 'warning'
-  if (resultType === '异常停止') return 'danger'
-  return 'info'
+function submitStatusTagClass(status: string) {
+  if (status === '提交成功') return 'tag-success'
+  if (status === '提交失败') return 'tag-danger'
+  if (status === '提交中') return 'tag-warning'
+  return 'tag-info'
 }
 
 function hasActiveTask(row: DeviceInfo) {
@@ -199,6 +295,11 @@ function taskTimerType(row: DeviceInfo) {
   if (diff >= TASK_DANGER_SECONDS) return 'danger'
   if (diff >= TASK_WARNING_SECONDS) return 'warning'
   return 'success'
+}
+
+function formatLogTime(value?: string | null) {
+  if (!value) return '-'
+  return new Date(value).toLocaleTimeString('zh-CN', { hour12: false })
 }
 
 function rowClassName({ row }: { row: DeviceInfo }) {
@@ -227,444 +328,696 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <el-row :gutter="20">
-    <el-col :span="17">
-      <el-card shadow="never" class="mb-4">
-        <template #header>
-          <div class="flex-between">
-            <span style="font-size: 16px; font-weight: 500;">设备管理</span>
-            <div>
-              <el-button type="primary" :icon="Refresh" plain @click="emit('refresh')">刷新状态</el-button>
-            </div>
-          </div>
-        </template>
-
-        <div class="flex-between mb-4">
-          <div class="flex-row" style="gap: 12px;">
-            <el-button type="primary" :icon="VideoPlay" @click="emit('start')" :disabled="selectedDevices.length === 0 || selectedAllRunning">
-              批量启动
-            </el-button>
-            <el-button type="danger" :icon="VideoPause" @click="emit('stop')" :disabled="selectedDevices.length === 0 || !selectedAllRunning">
-              批量停止
-            </el-button>
-          </div>
-          <div class="flex-row" style="gap: 12px;">
-            <el-select v-model="sortMode" style="width: 140px">
-              <el-option label="智能置顶" value="default" />
-              <el-option label="耗时最长" value="duration_desc" />
-            </el-select>
-            <el-input
-              v-model="searchDevice"
-              placeholder="搜索设备号"
-              :prefix-icon="Search"
-              style="width: 160px"
-              clearable
-            />
-          </div>
-        </div>
-
-        <div class="flex-row mb-4" style="gap: 12px;">
-          <el-input
-            :model-value="connectEndpoint"
-            placeholder="输入 IP:端口 连接新设备，例如 192.168.0.2:5555"
-            @input="emit('update:connectEndpoint', $event)"
-            @keydown.enter="emit('connect-device')"
-            style="flex: 1;"
-          >
-            <template #prefix>
-              <el-icon><Monitor /></el-icon>
-            </template>
-          </el-input>
-          <el-button type="success" :icon="Connection" :loading="connecting" @click="emit('connect-device')">
-            连接设备
-          </el-button>
-        </div>
-
-        <el-alert
-          title="任务由后端自动轮询账号池领取并派发给空闲设备，当前页面不再需要给设备单独绑定账号。"
-          type="info"
-          :closable="false"
-          class="mb-4"
-        />
-
-        <el-table
-          :data="filteredDevices"
-          style="width: 100%"
-          border
-          size="small"
-          @selection-change="handleSelectionChange"
-          :row-class-name="rowClassName"
-          row-key="serial"
-        >
-          <el-table-column type="selection" width="45" />
-          <el-table-column prop="serial" label="设备序列号" min-width="130" show-overflow-tooltip />
-          <el-table-column label="状态" width="70">
-            <template #default="{ row }">
-              <el-tag :type="row.status === 'device' ? 'success' : 'info'" size="small">
-                {{ row.status === 'device' ? '在线' : row.status }}
-              </el-tag>
-            </template>
-          </el-table-column>
-          <el-table-column label="运行情况" width="80">
-            <template #default="{ row }">
-              <el-tag :type="row.running ? 'primary' : 'info'" effect="dark" size="small">
-                {{ row.running ? '任务中' : '空闲' }}
-              </el-tag>
-            </template>
-          </el-table-column>
-          <el-table-column label="本次任务进度" min-width="220">
-            <template #default="{ row }">
-              <div v-if="row.current_task" style="display: flex; flex-direction: column; gap: 2px;">
-                <div style="font-size: 12px; color: #303133;" class="truncate" :title="row.current_task.task_id">
-                  <strong>{{ row.current_task.task_id }}</strong>
-                </div>
-                <div style="font-size: 11px; color: #606266;">
-                  {{ formatStage(row.current_task.current_stage) }} / 第 {{ row.current_task.loop_count }} 轮
-                </div>
-                <div style="font-size: 11px; color: #909399;" class="truncate" :title="row.current_task.current_message">
-                  {{ row.current_task.current_message || '-' }}
-                </div>
+  <div class="task-dashboard">
+    <el-row :gutter="24">
+      <!-- Left Column: Devices -->
+      <el-col :span="16">
+        <el-card shadow="never" class="modern-card device-panel">
+          <template #header>
+            <div class="flex-between card-header-custom">
+              <div class="header-title">
+                <span class="title-text">设备集群与任务调度</span>
+                <el-tag type="info" effect="light" round class="ml-3">在线 {{ filteredDevices.length }} 台</el-tag>
               </div>
-              <span v-else style="color: #c0c4cc; font-size: 12px;">暂无任务</span>
-            </template>
-          </el-table-column>
-          <el-table-column label="耗时" width="90">
-            <template #default="{ row }">
-              <el-tag v-if="hasActiveTask(row)" :type="taskTimerType(row)" effect="dark" size="small">
-                <el-icon style="vertical-align: middle; margin-right: 2px;"><Clock /></el-icon>
-                <span style="vertical-align: middle;">{{ formatDuration(row.current_task.started_at) }}</span>
-              </el-tag>
-              <span v-else style="color: #c0c4cc; font-size: 12px;">--:--</span>
-            </template>
-          </el-table-column>
-          <el-table-column label="统计(总/成/败)" width="110">
-            <template #default="{ row }">
-              <span style="font-size: 12px;">
-                <span style="color: #909399">{{ row.stats.total }}</span> / 
-                <span style="color: #67C23A">{{ row.stats.success }}</span> / 
-                <span style="color: #F56C6C">{{ row.stats.failure }}</span>
-              </span>
-            </template>
-          </el-table-column>
-          <el-table-column label="操作" width="130" fixed="right">
-            <template #default="{ row }">
-              <el-button type="primary" link size="small" @click="emit('inspect-device', row.serial)">
-                查看
-              </el-button>
-              <el-button
-                v-if="!row.running"
-                type="primary"
-                link
-                size="small"
-                @click="emit('start-device', row.serial)"
-              >
-                启动
-              </el-button>
-              <el-button
-                v-else
-                type="danger"
-                link
-                size="small"
-                @click="emit('stop-device', row.serial)"
-              >
-                停止
-              </el-button>
-            </template>
-          </el-table-column>
-        </el-table>
-      </el-card>
-    </el-col>
-
-    <el-col :span="7">
-      <el-card shadow="never" class="dashboard-card mb-4">
-        <template #header>
-          <div class="flex-between">
-            <span style="font-size: 16px; font-weight: 500;">候选区列表</span>
-            <el-tag size="small" type="info">{{ props.pendingTasks.length }} 个任务</el-tag>
-          </div>
-        </template>
-
-        <div v-if="props.pendingTasks.length === 0">
-          <el-empty description="候选区暂无等待任务" :image-size="52" />
-        </div>
-        <div v-else class="queue-list">
-          <div v-for="task in props.pendingTasks" :key="task.task_id" class="queue-item">
-            <div class="queue-item-head">
-              <div class="truncate" :title="task.task_id">
-                <strong>{{ task.task_id }}</strong>
+              <div class="header-actions">
+                <el-button type="primary" plain @click="emit('refresh')">刷新状态</el-button>
               </div>
-              <el-tag size="small" type="primary">{{ task.item_count }} 个 SKU</el-tag>
             </div>
-            <div class="queue-item-line">
-              <span>来源：</span>
-              <span class="truncate" :title="task.source_name || task.source_code || '-'">
-                {{ task.source_name || task.source_code || '-' }}
-              </span>
-            </div>
-            <div class="queue-item-line">
-              <span>账号：</span>
-              <span class="truncate" :title="task.account_name || '-'">
-                {{ task.account_name || '默认账号' }}
-              </span>
-            </div>
-            <div class="queue-item-line">
-              <span>上游任务号：</span>
-              <span class="truncate" :title="task.upstream_task_ref || '-'">
-                {{ task.upstream_task_ref || '-' }}
-              </span>
-            </div>
-            <div class="queue-item-line">
-              <span>进入候选区：</span>
-              <span>{{ formatDateTime(task.prefetched_at) }}</span>
-            </div>
-          </div>
-        </div>
-      </el-card>
+          </template>
 
-      <el-card shadow="never" class="dashboard-card">
-        <template #header>
-          <div class="flex-between">
-            <span style="font-size: 16px; font-weight: 500;">实时任务日志</span>
-            <el-input
-              v-model="searchLog"
-              placeholder="筛选结果..."
-              :prefix-icon="Search"
-              style="width: 120px"
-              size="small"
-              clearable
-            />
-          </div>
-        </template>
-        
-        <div class="log-container">
-          <el-empty v-if="filteredLogs.length === 0" description="暂无结果日志" :image-size="60" />
-          <div v-else class="log-list">
-            <div class="log-list-head">
-              <span>上报结果</span>
-              <span>识别结果类型</span>
-              <span>识别结果内容</span>
+          <div class="action-bar mb-5">
+            <div class="action-group">
+              <el-button type="primary" @click="emit('start')" :disabled="selectedDevices.length === 0 || selectedAllRunning" class="control-btn">
+                批量启动
+              </el-button>
+              <el-button type="danger" plain @click="emit('stop')" :disabled="selectedDevices.length === 0 || !selectedAllRunning" class="control-btn">
+                批量停止
+              </el-button>
             </div>
-            <div
-              v-for="event in filteredLogs"
-              :key="event.id"
-              class="log-item"
-              :class="[`log-${event.level}`, { 'log-item-expanded': expandedLogId === event.id }]"
-              @click="toggleLogExpand(event.id)"
+            
+            <div class="filter-group">
+              <el-select v-model="sortMode" class="sort-select">
+                <el-option label="智能置顶" value="default" />
+                <el-option label="耗时最长" value="duration_desc" />
+              </el-select>
+              <el-input
+                v-model="searchDevice"
+                placeholder="搜索设备号"
+                clearable
+                class="search-input"
+              />
+            </div>
+          </div>
+
+          <div class="connect-bar mb-5">
+            <el-input
+              :model-value="connectEndpoint"
+              placeholder="输入 IP:端口 连接新设备，例如 192.168.0.2:5555"
+              @input="emit('update:connectEndpoint', $event)"
+              @keydown.enter="emit('connect-device')"
+              class="connect-input"
             >
-              <div class="log-main-row">
-                <div class="log-col">
-                  <el-tag :type="reportTagType(event.report_result)" effect="dark" size="small">
-                    {{ event.report_result }}
-                  </el-tag>
+              <template #prefix>
+                <span class="prefix-text">TCP/IP</span>
+              </template>
+            </el-input>
+            <el-button type="success" :loading="connecting" @click="emit('connect-device')" class="connect-btn">
+              连接设备
+            </el-button>
+          </div>
+
+          <el-table
+            :data="filteredDevices"
+            class="modern-table"
+            @selection-change="handleSelectionChange"
+            :row-class-name="rowClassName"
+            row-key="serial"
+          >
+            <el-table-column type="selection" width="45" align="center" />
+            
+            <el-table-column label="设备终端" min-width="160" show-overflow-tooltip>
+              <template #default="{ row }">
+                <div class="device-identity">
+                  <span class="serial mono-text">{{ row.serial }}</span>
+                  <div class="status-badges">
+                    <span class="badge" :class="row.status === 'device' ? 'bg-green' : 'bg-gray'">
+                      {{ row.status === 'device' ? '在线' : row.status }}
+                    </span>
+                    <span class="badge" :class="row.running ? 'bg-blue' : 'bg-gray'">
+                      {{ row.running ? '运行中' : '空闲' }}
+                    </span>
+                  </div>
                 </div>
-                <div class="log-col">
-                  <el-tag :type="recognitionTagType(event.recognition_type)" size="small">
-                    {{ event.recognition_type }}
-                  </el-tag>
+              </template>
+            </el-table-column>
+
+            <el-table-column label="当前任务执行进度" min-width="260">
+              <template #default="{ row }">
+                <div v-if="row.current_task" class="task-progress-cell">
+                  <div class="task-id-row">
+                    <span class="label">任务</span>
+                    <span class="value mono-text truncate" :title="row.current_task.task_id">{{ row.current_task.task_id }}</span>
+                  </div>
+                  <div class="stage-row">
+                    <span class="stage-tag">{{ formatStage(row.current_task.current_stage) }}</span>
+                    <span class="loop-tag">第 {{ row.current_task.loop_count }} 轮</span>
+                  </div>
+                  <div class="msg-row truncate" :title="row.current_task.current_message">
+                    {{ row.current_task.current_message || '-' }}
+                  </div>
                 </div>
-                <div class="log-col log-col-content" :title="event.recognition_content">
-                  {{ event.recognition_content }}
+                <div v-else class="empty-task-cell">当前无派发任务</div>
+              </template>
+            </el-table-column>
+
+            <el-table-column label="运行耗时" width="100" align="center">
+              <template #default="{ row }">
+                <div v-if="hasActiveTask(row)" class="duration-badge" :class="taskTimerType(row)">
+                  {{ formatDuration(row.current_task.started_at) }}
                 </div>
+                <span v-else class="text-gray text-xs">--:--</span>
+              </template>
+            </el-table-column>
+
+            <el-table-column label="产出(成/败)" width="120" align="center">
+              <template #default="{ row }">
+                <div class="stats-compact">
+                  <span class="text-green font-medium">{{ row.stats.success }}</span>
+                  <span class="text-gray mx-1">/</span>
+                  <span class="text-red font-medium">{{ row.stats.failure }}</span>
+                </div>
+              </template>
+            </el-table-column>
+
+            <el-table-column label="操作" width="140" align="center" fixed="right">
+              <template #default="{ row }">
+                <div class="table-actions">
+                  <el-button link type="primary" @click="emit('inspect-device', row.serial)">查看</el-button>
+                  <el-button
+                    v-if="!row.running"
+                    link
+                    type="primary"
+                    @click="emit('start-device', row.serial)"
+                  >启动</el-button>
+                  <el-button
+                    v-else
+                    link
+                    type="danger"
+                    @click="emit('stop-device', row.serial)"
+                  >停止</el-button>
+                </div>
+              </template>
+            </el-table-column>
+          </el-table>
+        </el-card>
+      </el-col>
+
+      <!-- Right Column: Queue & Logs -->
+      <el-col :span="8">
+        <div class="right-panels-stack">
+          <!-- Pending Queue -->
+          <el-card shadow="never" class="modern-card side-panel">
+            <template #header>
+              <div class="flex-between">
+                <span class="card-title">调度候选区</span>
+                <span class="count-badge">{{ props.pendingTasks.length }}</span>
               </div>
-              <div v-if="expandedLogId === event.id" class="log-detail">
-                <div class="log-header">
-                  <span class="log-time">{{ new Date(event.timestamp).toLocaleString('zh-CN', { hour12: false }) }}</span>
-                  <span class="log-device" v-if="event.device_id" :title="event.device_id">{{ event.device_id }}</span>
+            </template>
+
+            <div v-if="props.pendingTasks.length === 0" class="empty-panel">
+              <div class="empty-text">候选区暂无等待任务</div>
+            </div>
+            
+            <div v-else class="queue-list">
+              <div v-for="task in props.pendingTasks" :key="task.task_id" class="queue-card">
+                <div class="qc-header">
+                  <span class="qc-id mono-text truncate" :title="task.task_id">{{ task.task_id }}</span>
+                  <span class="qc-status" :class="task.status">{{ queueStatusLabel(task.status) }}</span>
                 </div>
-                <div class="log-detail-line"><strong>任务ID：</strong>{{ event.task_id || '-' }}</div>
-                <div class="log-detail-line"><strong>上游任务号：</strong>{{ event.upstream_task_ref || '-' }}</div>
-                <div class="log-detail-line"><strong>结果说明：</strong>{{ event.message || '-' }}</div>
-                <pre v-if="formatLogPayload(event.report_payload)" class="log-payload">{{ formatLogPayload(event.report_payload) }}</pre>
+                
+                <div class="qc-body">
+                  <div class="qc-row">
+                    <span class="qc-label">上游</span>
+                    <span class="qc-value truncate" :title="task.source_name || task.source_code || '-'">{{ task.source_name || task.source_code || '-' }}</span>
+                  </div>
+                  <div class="qc-row">
+                    <span class="qc-label">账号</span>
+                    <span class="qc-value truncate" :title="task.account_name || '-'">{{ task.account_name || '默认账号' }}</span>
+                  </div>
+                  <div class="qc-row">
+                    <span class="qc-label">进度</span>
+                    <span class="qc-value">待 {{ task.pending_count ?? task.item_count }} · 中 {{ task.active_count ?? 0 }} · 成 {{ task.completed_count ?? 0 }}</span>
+                  </div>
+                </div>
               </div>
             </div>
-          </div>
+          </el-card>
+
+          <!-- Task Logs -->
+          <el-card shadow="never" class="modern-card side-panel logs-panel">
+            <template #header>
+              <div class="flex-between">
+                <span class="card-title">实时任务日志</span>
+                <el-input
+                  v-model="searchLog"
+                  placeholder="检索日志..."
+                  class="log-search"
+                  clearable
+                />
+              </div>
+            </template>
+            
+            <div class="log-container">
+              <div v-if="filteredLogs.length === 0" class="empty-panel">
+                <div class="empty-text">暂无执行日志</div>
+              </div>
+              
+              <div v-else class="modern-log-list">
+                <div
+                  v-for="event in filteredLogs"
+                  :key="event.id"
+                  class="log-card"
+                  :class="[`level-${event.level}`, { 'is-expanded': expandedLogId === event.id }]"
+                  @click="toggleLogExpand(event.id)"
+                >
+                  <div class="lc-summary">
+                    <div class="lc-time">{{ formatLogTime(event.timestamp) }}</div>
+                    <div class="lc-main">
+                      <div class="lc-tags">
+                        <span class="lc-tag" :class="recognitionTagClass(event.recognition_result)">{{ event.recognition_result }}</span>
+                        <span class="lc-tag" :class="submitStatusTagClass(event.submit_status)">{{ event.submit_status }}</span>
+                      </div>
+                      <div class="lc-text truncate" :title="event.recognition_text">{{ event.recognition_text }}</div>
+                    </div>
+                  </div>
+                  
+                  <div v-if="expandedLogId === event.id" class="lc-detail">
+                    <div class="lc-detail-grid">
+                      <div class="lc-detail-item">
+                        <span class="label">时间</span>
+                        <span class="value">{{ new Date(event.timestamp).toLocaleString('zh-CN', { hour12: false }) }}</span>
+                      </div>
+                      <div class="lc-detail-item">
+                        <span class="label">设备</span>
+                        <span class="value text-blue">{{ event.device_id || '-' }}</span>
+                      </div>
+                      <div class="lc-detail-item">
+                        <span class="label">识别结果</span>
+                        <span class="value">{{ event.recognition_result || '-' }}</span>
+                      </div>
+                      <div class="lc-detail-item">
+                        <span class="label">识别文本</span>
+                        <span class="value">{{ event.recognition_text || '-' }}</span>
+                      </div>
+                      <div class="lc-detail-item">
+                        <span class="label">提交状态</span>
+                        <span class="value">{{ event.submit_status || '-' }}</span>
+                      </div>
+                      <div class="lc-detail-item">
+                        <span class="label">goods_id</span>
+                        <span class="value mono-text">{{ event.goods_id || '-' }}</span>
+                      </div>
+                      <div class="lc-detail-item">
+                        <span class="label">sku_id</span>
+                        <span class="value mono-text">{{ event.sku_id || '-' }}</span>
+                      </div>
+                      <div class="lc-detail-item">
+                        <span class="label">任务ID</span>
+                        <span class="value mono-text">{{ event.task_id || '-' }}</span>
+                      </div>
+                      <div class="lc-detail-item">
+                        <span class="label">说明</span>
+                        <span class="value">{{ event.message || '-' }}</span>
+                      </div>
+                    </div>
+                    
+                    <div v-if="formatLogPayload(event.report_payload)" class="lc-code-block">
+                      <div class="code-title">上报参数</div>
+                      <pre>{{ formatLogPayload(event.report_payload) }}</pre>
+                    </div>
+                    
+                    <div v-if="event.error" class="lc-error-block">
+                      {{ event.error }}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </el-card>
         </div>
-      </el-card>
-    </el-col>
-  </el-row>
+      </el-col>
+    </el-row>
+  </div>
 </template>
 
 <style scoped>
-.dashboard-card :deep(.el-card__body) {
-  flex: 1;
-  overflow: hidden;
+/* Base Layout */
+.task-dashboard {
   display: flex;
   flex-direction: column;
-  padding: 0;
 }
 
-.truncate {
-  white-space: nowrap;
+.right-panels-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  height: calc(100vh - 120px);
+}
+
+.mb-5 { margin-bottom: 20px; }
+.ml-3 { margin-left: 12px; }
+.mx-1 { margin-left: 4px; margin-right: 4px; }
+.truncate { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* Modern Card Design */
+.modern-card {
+  border-radius: 12px;
+  border: 1px solid #f1f5f9;
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03);
+  background: #ffffff;
+}
+
+.modern-card :deep(.el-card__header) {
+  padding: 16px 20px;
+  border-bottom: 1px solid #f1f5f9;
+}
+
+.modern-card :deep(.el-card__body) {
+  padding: 20px;
+}
+
+.card-header-custom {
+  display: flex;
+  align-items: center;
+}
+
+.title-text, .card-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: #0f172a;
+}
+
+.flex-between {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+/* Actions & Filters */
+.action-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 16px;
+}
+
+.action-group, .filter-group {
+  display: flex;
+  gap: 12px;
+}
+
+.control-btn {
+  padding-left: 20px;
+  padding-right: 20px;
+  font-weight: 500;
+}
+
+.sort-select { width: 140px; }
+.search-input { width: 200px; }
+
+.connect-bar {
+  display: flex;
+  gap: 12px;
+  background: #f8fafc;
+  padding: 12px;
+  border-radius: 8px;
+  border: 1px solid #e2e8f0;
+}
+
+.connect-input { flex: 1; }
+.prefix-text {
+  font-size: 12px;
+  font-weight: 600;
+  color: #64748b;
+  display: flex;
+  align-items: center;
+  height: 100%;
+}
+.connect-btn { font-weight: 500; }
+
+/* Table Typography & Badges */
+.modern-table {
+  border-radius: 8px;
+  border: 1px solid #e2e8f0;
+}
+
+.modern-table :deep(th.el-table__cell) {
+  background-color: #f8fafc;
+  color: #475569;
+  font-weight: 600;
+  height: 44px;
+}
+
+.mono-text {
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;
+}
+
+.device-identity {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.device-identity .serial {
+  font-size: 13px;
+  font-weight: 500;
+  color: #1e293b;
+}
+
+.status-badges {
+  display: flex;
+  gap: 6px;
+}
+
+.badge {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 6px;
+  border-radius: 4px;
+  line-height: 1;
+}
+.bg-green { background: #dcfce7; color: #166534; }
+.bg-blue { background: #e0f2fe; color: #075985; }
+.bg-gray { background: #f1f5f9; color: #475569; }
+
+/* Task Progress Cell */
+.task-progress-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.task-id-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.task-id-row .label { font-size: 11px; color: #94a3b8; }
+.task-id-row .value { font-size: 12px; color: #334155; font-weight: 500; }
+
+.stage-row {
+  display: flex;
+  gap: 6px;
+}
+.stage-tag, .loop-tag {
+  font-size: 11px;
+  background: #f1f5f9;
+  color: #475569;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+.stage-tag { background: #e0e7ff; color: #1e40af; font-weight: 500; }
+
+.msg-row {
+  font-size: 12px;
+  color: #64748b;
+}
+
+.empty-task-cell {
+  font-size: 12px;
+  color: #94a3b8;
+  font-style: italic;
+}
+
+/* Duration Badges */
+.duration-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  font-family: monospace;
+}
+.duration-badge.success { background: #f8fafc; color: #475569; }
+.duration-badge.warning { background: #fef3c7; color: #b45309; }
+.duration-badge.danger { background: #fee2e2; color: #b91c1c; }
+
+/* Row Highlight Classes */
+:deep(.el-table .task-row-warning td) { background-color: #fffbeb !important; }
+:deep(.el-table .task-row-danger td) { background-color: #fef2f2 !important; }
+
+.stats-compact {
+  font-size: 13px;
+  font-family: monospace;
+}
+.text-green { color: #10b981; }
+.text-red { color: #ef4444; }
+.text-blue { color: #0ea5e9; }
+.text-gray { color: #94a3b8; }
+.font-medium { font-weight: 600; }
+
+.table-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+}
+
+/* Queue Panel */
+.side-panel {
+  display: flex;
+  flex-direction: column;
+}
+.side-panel :deep(.el-card__body) {
+  padding: 0;
+  flex: 1;
   overflow: hidden;
-  text-overflow: ellipsis;
+}
+
+.count-badge {
+  background: #f1f5f9;
+  color: #475569;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.empty-panel {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 120px;
+}
+.empty-text {
+  font-size: 13px;
+  color: #94a3b8;
 }
 
 .queue-list {
+  max-height: 280px;
+  overflow-y: auto;
+  padding: 12px;
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  max-height: 240px;
-  overflow-y: auto;
-  padding: 0 12px 12px;
-}
-
-.log-container {
-  max-height: 320px;
-  overflow-y: auto;
-  padding: 0 12px 12px;
-}
-
-.queue-item {
-  border: 1px solid #ebeef5;
-  border-radius: 8px;
-  background: #fff;
-  padding: 10px 12px;
-}
-
-.queue-item-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  margin-bottom: 8px;
-  font-size: 13px;
-  color: #303133;
-}
-
-.queue-item-line {
-  display: grid;
-  grid-template-columns: 72px 1fr;
-  gap: 6px;
-  align-items: start;
-  font-size: 12px;
-  color: #606266;
-  line-height: 1.6;
-}
-
-:deep(.el-table .task-row-warning td) {
-  background: #fff7e6 !important;
-}
-
-:deep(.el-table .task-row-danger td) {
-  background: #fff1f0 !important;
-}
-
-.log-container {
-  flex: 1;
-  overflow-y: auto;
-  background: #f8f9fa;
-}
-
-.log-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  padding: 8px;
-}
-
-.log-list-head {
-  display: grid;
-  grid-template-columns: 88px 92px 1fr;
-  gap: 8px;
-  padding: 0 12px;
-  font-size: 12px;
-  color: #909399;
-}
-
-.log-item {
-  padding: 10px 12px;
-  border: 1px solid #ebeef5;
-  border-radius: 8px;
-  background: #fff;
-  transition: background-color 0.2s, border-color 0.2s;
-  cursor: pointer;
-}
-
-.log-item:hover {
-  background: #f4f6f8;
-  border-color: #dcdfe6;
-}
-
-.log-item-expanded {
-  border-color: #c6e2ff;
-  background: #f8fbff;
-}
-
-.log-main-row {
-  display: grid;
-  grid-template-columns: 88px 92px 1fr;
-  gap: 8px;
-  align-items: center;
-}
-
-.log-col {
-  min-width: 0;
-}
-
-.log-col-content {
-  font-size: 13px;
-  color: #303133;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.log-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 8px;
-}
-
-.log-time {
-  font-size: 12px;
-  color: #909399;
-  font-family: monospace;
-}
-
-.log-device {
-  font-size: 11px;
-  color: #409EFF;
-  background: #ecf5ff;
-  padding: 1px 6px;
-  border-radius: 4px;
-  max-width: 120px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.log-detail {
-  margin-top: 10px;
-  padding-top: 10px;
-  border-top: 1px dashed #e4e7ed;
-}
-
-.log-detail-line {
-  font-size: 12px;
-  color: #606266;
-  line-height: 1.7;
-  word-break: break-all;
-}
-
-.log-payload {
-  margin: 6px 0 0;
-  padding: 8px 10px;
-  font-size: 12px;
-  line-height: 1.45;
-  color: #606266;
+  gap: 12px;
   background: #f8fafc;
-  border: 1px solid #ebeef5;
+}
+
+.queue-card {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.qc-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+  padding-bottom: 8px;
+  border-bottom: 1px dashed #f1f5f9;
+}
+.qc-id { font-size: 13px; font-weight: 600; color: #1e293b; max-width: 140px; }
+.qc-status { font-size: 11px; padding: 2px 6px; border-radius: 4px; font-weight: 500; }
+.qc-status.active { background: #fef3c7; color: #b45309; }
+.qc-status.completed { background: #dcfce7; color: #166534; }
+.qc-status.released { background: #f1f5f9; color: #475569; }
+
+.qc-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.qc-row {
+  display: flex;
+  font-size: 12px;
+}
+.qc-label { color: #94a3b8; width: 36px; flex-shrink: 0; }
+.qc-value { color: #475569; }
+
+/* Logs Panel */
+.logs-panel { flex: 1; }
+.log-search { width: 140px; }
+
+.log-container {
+  height: 100%;
+  overflow-y: auto;
+  background: #f8fafc;
+  padding: 12px;
+}
+
+.modern-log-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.log-card {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 12px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+.log-card:hover { border-color: #cbd5e1; }
+.log-card.is-expanded { border-color: #bae6fd; background: #f0f9ff; }
+
+.lc-summary {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+}
+.lc-time {
+  font-size: 12px;
+  color: #64748b;
+  font-family: monospace;
+  padding-top: 2px;
+  flex-shrink: 0;
+}
+.lc-main {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  flex: 1;
+}
+.lc-tags {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.lc-tag {
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-weight: 500;
+}
+/* Tag classes mapped in setup */
+.tag-success { background: #dcfce7; color: #166534; }
+.tag-danger { background: #fee2e2; color: #b91c1c; }
+.tag-warning { background: #fef3c7; color: #b45309; }
+.tag-info { background: #f1f5f9; color: #475569; }
+
+.lc-text {
+  font-size: 12px;
+  color: #334155;
+}
+
+.lc-detail {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px dashed #cbd5e1;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.lc-detail-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.lc-detail-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.lc-detail-item .label { font-size: 11px; color: #94a3b8; }
+.lc-detail-item .value { font-size: 12px; color: #334155; word-break: break-all; }
+
+.lc-code-block {
+  background: #1e293b;
   border-radius: 6px;
+  overflow: hidden;
+}
+.code-title {
+  background: #334155;
+  color: #cbd5e1;
+  font-size: 11px;
+  padding: 4px 8px;
+}
+.lc-code-block pre {
+  margin: 0;
+  padding: 8px;
+  font-size: 11px;
+  color: #e2e8f0;
+  font-family: 'SFMono-Regular', Consolas, monospace;
   white-space: pre-wrap;
   word-break: break-all;
-  font-family: Consolas, Monaco, monospace;
 }
 
-.log-warning .log-msg {
-  color: #e6a23c;
-}
-.log-error .log-msg {
-  color: #f56c6c;
+.lc-error-block {
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  color: #b91c1c;
+  padding: 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  white-space: pre-wrap;
 }
 </style>

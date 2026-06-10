@@ -21,12 +21,13 @@ This directory contains the initial scaffold only. Go and Rust toolchains are re
 ## Start on Windows
 
 - `start-adapter.bat`: start Rust adapter on `127.0.0.1:8091`
-- `start-unified-server.bat`: start Go business server on `127.0.0.1:8080`
+- `start-unified-server.bat`: start Go business server on `127.0.0.1:18080`
 - `start-frontend.bat`: start Vue dev server on `127.0.0.1:5173`
 - `start-dev-all.bat`: start all three in separate terminal windows
 
 ## Docs
 
+- `docs/software-manual.md`: 面向使用人员的软件使用说明书，包含 Windows 下 ADB 环境变量配置
 - `docs/ai-handoff.md`: current status, legacy protocol notes, migration plan, pending work
 - `docs/adapter-apipost.md`: adapter and unified-server Apipost examples
 - `docs/architecture.md`: architecture draft

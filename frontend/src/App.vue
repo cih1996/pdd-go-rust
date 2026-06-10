@@ -13,12 +13,13 @@ import {
   fetchState,
   getAssetUrl,
   getWsUrl,
+  importMockData,
   importTemplates,
   importPlatformAccounts,
   moveTemplate,
-  runDebug,
   runDebugOcrSelectionTest,
   runDebugSelectionTest,
+  sendWsMessage,
   startTasks,
   stopTasks,
   testTemplate,
@@ -28,7 +29,6 @@ import {
   updateUpstreamConfig,
   updateSystemConfig,
 } from './api'
-import AdapterSubmitLogTab from './components/AdapterSubmitLogTab.vue'
 import DebugTab from './components/DebugTab.vue'
 import DetailTab from './components/DetailTab.vue'
 import PlatformAccountTab from './components/PlatformAccountTab.vue'
@@ -39,13 +39,16 @@ import UpstreamConfigTab from './components/UpstreamConfigTab.vue'
 import { normalizeApiDateString } from './utils/datetime'
 import type {
   AdapterSubmitLogRecord,
+  AdapterStatePayload,
   DashboardState,
   DebugCaptureResult,
   DebugResult,
+  DebugRunStreamEvent,
   DebugSelectionTestResult,
   DesktopUpdateStatus,
   DetailRecord,
   DeviceInfo,
+  MockDataImportResult,
   PlatformAccountRecord,
   PendingTaskRecord,
   ServiceLinkStatus,
@@ -72,9 +75,11 @@ const savingSystemConfig = ref(false)
 const savingUpstreamId = ref('')
 const importingAccounts = ref(false)
 const savingAccountId = ref('')
+const batchProcessingAccounts = ref(false)
 const launchingServiceKey = ref('')
 const desktopUpdateLoading = ref(false)
 const importingTemplatePack = ref(false)
+const importingMockData = ref(false)
 const connectEndpoint = ref('')
 const selectedDevices = ref<string[]>([])
 const inspectedDeviceId = ref('')
@@ -82,6 +87,7 @@ const debugResult = ref<DebugResult | null>(null)
 const debugCapture = ref<DebugCaptureResult | null>(null)
 const debugSelectionResult = ref<DebugSelectionTestResult | null>(null)
 const templateTestResult = ref<TemplateTestResult | null>(null)
+const debugStreamEvents = ref<Array<{ type: string; data: DebugRunStreamEvent }>>([])
 const errorMessage = ref('')
 const state = ref<DashboardState>({
   devices: [],
@@ -102,6 +108,7 @@ const state = ref<DashboardState>({
   platform_accounts: [],
   upstream_options: [],
   service_links: [],
+  adapter_state: null,
 })
 
 let ws: WebSocket | null = null
@@ -109,6 +116,7 @@ let wsReconnectTimer: number | null = null
 let statePollTimer: number | null = null
 let wsManuallyClosed = false
 const wsConnected = ref(false)
+const activeDebugRequestId = ref('')
 
 const devices = computed<DeviceInfo[]>(() => state.value.devices)
 const templates = computed<TemplateRecord[]>(() => state.value.templates)
@@ -150,6 +158,20 @@ function normalizeAdapterSubmitLog(log: AdapterSubmitLogRecord): AdapterSubmitLo
   }
 }
 
+function normalizeAdapterState(adapterState?: AdapterStatePayload | null): AdapterStatePayload | null {
+  if (!adapterState) {
+    return null
+  }
+  return {
+    ...adapterState,
+    recent_logs: (adapterState.recent_logs ?? []).map(normalizeEvent),
+    recent_snapshots: (adapterState.recent_snapshots ?? []).map((item) => ({
+      ...item,
+      timestamp: normalizeApiDateString(item.timestamp),
+    })),
+  }
+}
+
 function normalizeState(nextState: DashboardState): DashboardState {
   return {
     ...nextState,
@@ -169,6 +191,7 @@ function normalizeState(nextState: DashboardState): DashboardState {
     templates: nextState.templates.map((item) => ({ ...item, image_url: getAssetUrl(item.image_url) })),
     details: nextState.details.map(normalizeDetail),
     service_links: nextState.service_links ?? [],
+    adapter_state: normalizeAdapterState(nextState.adapter_state),
   }
 }
 
@@ -226,24 +249,54 @@ function connectWs() {
   ws = new WebSocket(getWsUrl())
   ws.onopen = () => {
     wsConnected.value = true
+    stopStatePoll()
     void loadState()
   }
   ws.onmessage = (event) => {
-    const payload = JSON.parse(event.data) as { type: string; data: DashboardState | TaskEvent | DetailRecord }
+    const payload = JSON.parse(event.data) as { type: string; data: DashboardState | TaskEvent | DetailRecord | DebugRunStreamEvent }
     if (payload.type === 'state') {
       mergeState(payload.data as DashboardState)
     } else if (payload.type === 'event') {
       state.value.event_log = [normalizeEvent(payload.data as TaskEvent), ...state.value.event_log].slice(0, 200)
     } else if (payload.type === 'detail') {
       state.value.details = [normalizeDetail(payload.data as DetailRecord), ...state.value.details].slice(0, 200)
+    } else if ((payload.data as DebugRunStreamEvent)?.request_id && (payload.data as DebugRunStreamEvent).request_id === activeDebugRequestId.value) {
+      const debugData = payload.data as DebugRunStreamEvent
+      if (debugData.capture_url) {
+        debugData.capture_url = getAssetUrl(debugData.capture_url)
+      }
+      debugStreamEvents.value = [...debugStreamEvents.value, { type: payload.type, data: debugData }].slice(-300)
+      if (payload.type === 'debug_run_finished' && debugData.result) {
+        const result = debugData.result as DebugResult
+        debugResult.value = {
+          ...result,
+          detail: {
+            ...result.detail,
+            capture_url: getAssetUrl(result.detail.capture_url),
+            capture_urls: (result.detail.capture_urls ?? []).map((item) => getAssetUrl(item)),
+          },
+        }
+        debugRunning.value = false
+        ElMessage.success('调试执行完成')
+        void loadState()
+      } else if (payload.type === 'debug_run_error') {
+        debugRunning.value = false
+        errorMessage.value = debugData.message ?? '调试执行失败'
+        ElMessage.error(errorMessage.value)
+      } else if (payload.type === 'debug_run_cancelled') {
+        debugRunning.value = false
+        ElMessage.warning('调试已取消')
+      }
     }
   }
   ws.onerror = () => {
     wsConnected.value = false
+    startStatePoll()
   }
   ws.onclose = () => {
     wsConnected.value = false
     ws = null
+    startStatePoll()
     scheduleWsReconnect()
   }
 }
@@ -278,7 +331,7 @@ async function handleStart() {
     return
   }
   try {
-    await startTasks(selectedDevices.value, 'mock')
+    await startTasks(selectedDevices.value, 'live')
     ElMessage.success('任务已启动')
     await loadState()
   } catch (error) {
@@ -290,7 +343,7 @@ async function handleStart() {
 async function handleStartSingle(deviceId: string) {
   selectedDevices.value = [deviceId]
   try {
-    await startTasks([deviceId], 'mock')
+    await startTasks([deviceId], 'live')
     ElMessage.success(`设备 ${deviceId} 任务已启动`)
     await loadState()
   } catch (error) {
@@ -422,24 +475,26 @@ async function handleTestTemplate(templateId: string, payload: FormData) {
 }
 
 async function handleRunDebug(payload: { device_id: string; mode: 'url' | 'current'; url?: string }) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    ElMessage.error('WebSocket 未连接，无法启动单步调试')
+    return
+  }
   debugRunning.value = true
   try {
-    const result = await runDebug(payload)
-    debugResult.value = {
-      ...result,
-      detail: {
-        ...result.detail,
-        capture_url: getAssetUrl(result.detail.capture_url),
-        capture_urls: (result.detail.capture_urls ?? []).map((item) => getAssetUrl(item)),
-      },
-    }
-    ElMessage.success('调试执行完成')
-    await loadState()
+    const requestId = `debug_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`
+    activeDebugRequestId.value = requestId
+    debugResult.value = null
+    debugStreamEvents.value = []
+    sendWsMessage(ws, 'debug_run', {
+      request_id: requestId,
+      device_id: payload.device_id,
+      mode: payload.mode,
+      url: payload.url,
+    })
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '调试执行失败'
-    ElMessage.error(errorMessage.value)
-  } finally {
     debugRunning.value = false
+    ElMessage.error(errorMessage.value)
   }
 }
 
@@ -547,7 +602,6 @@ async function handleCreateUpstreamConfig(payload: {
   enabled?: boolean
   priority?: number
   base_url: string
-  token?: string | null
   notes?: string | null
 }) {
   savingUpstreamId.value = '__creating__'
@@ -571,7 +625,6 @@ async function handleUpdateUpstreamConfig(payload: {
     enabled?: boolean
     priority?: number
     base_url: string
-    token?: string | null
     notes?: string | null
   }
 }) {
@@ -616,6 +669,19 @@ async function handleDeleteUpstreamConfig(upstreamId: string) {
   }
 }
 
+async function handleImportMockData(payload: { lines: string; replace_existing: boolean }) {
+  importingMockData.value = true
+  try {
+    const result: MockDataImportResult = await importMockData(payload)
+    ElMessage.success(`模拟数据导入成功，共导入 ${result.imported_count} 条，当前缓存 ${result.total_count} 条`)
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '导入模拟数据失败'
+    ElMessage.error(errorMessage.value)
+  } finally {
+    importingMockData.value = false
+  }
+}
+
 async function handleImportPlatformAccounts(payload: { upstream_code: string; lines: string }) {
   importingAccounts.value = true
   try {
@@ -655,6 +721,34 @@ async function handleDeletePlatformAccount(accountId: string) {
     ElMessage.error(errorMessage.value)
   } finally {
     savingAccountId.value = ''
+  }
+}
+
+async function handleBatchTogglePlatformAccounts(payload: { accountIds: string[]; enabled: boolean }) {
+  batchProcessingAccounts.value = true
+  try {
+    await Promise.all(payload.accountIds.map(id => togglePlatformAccount(id, payload.enabled)))
+    ElMessage.success(payload.enabled ? '批量启用成功' : '批量停用成功')
+    await loadState()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '批量更新失败'
+    ElMessage.error(errorMessage.value)
+  } finally {
+    batchProcessingAccounts.value = false
+  }
+}
+
+async function handleBatchDeletePlatformAccounts(accountIds: string[]) {
+  batchProcessingAccounts.value = true
+  try {
+    await Promise.all(accountIds.map(id => deletePlatformAccount(id)))
+    ElMessage.success('批量删除成功')
+    await loadState()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '批量删除失败'
+    ElMessage.error(errorMessage.value)
+  } finally {
+    batchProcessingAccounts.value = false
   }
 }
 
@@ -758,15 +852,17 @@ async function handleRestartForDesktopUpdate() {
 
 onMounted(async () => {
   wsManuallyClosed = false
-  startStatePoll()
+  connectWs()
   await loadState()
+  if (!wsConnected.value) {
+    startStatePoll()
+  }
   if (window.desktopApp?.isElectron) {
     await refreshDesktopUpdateStatus()
     disposeDesktopUpdateListener = window.desktopApp.onUpdateStatus((status) => {
       desktopUpdateStatus.value = status
     })
   }
-  connectWs()
 })
 
 onUnmounted(() => {
@@ -806,10 +902,6 @@ onUnmounted(() => {
           <el-icon><DataLine /></el-icon>
           <span>执行明细</span>
         </el-menu-item>
-        <el-menu-item index="adapter-log">
-          <el-icon><Document /></el-icon>
-          <span>适配器交互日志</span>
-        </el-menu-item>
         <el-menu-item index="account">
           <el-icon><User /></el-icon>
           <span>平台账号</span>
@@ -841,8 +933,6 @@ onUnmounted(() => {
               ? '设备与任务'
               : activeTab === 'detail'
                 ? '执行明细'
-                : activeTab === 'adapter-log'
-                  ? '适配器完整交互日志'
                 : activeTab === 'account'
                   ? '平台账号'
                 : activeTab === 'upstream'
@@ -944,6 +1034,8 @@ onUnmounted(() => {
           v-if="activeTab === 'task'"
           :devices="devices"
           :event-log="eventLog"
+          :details="details"
+          :adapter-submit-logs="adapterSubmitLogs"
           :pending-tasks="pendingTasks"
           :selected-devices="selectedDevices"
           :selected-all-running="selectedAllRunning"
@@ -959,12 +1051,6 @@ onUnmounted(() => {
           @start-device="handleStartSingle"
           @stop-device="handleStopSingle"
           @inspect-device="handleInspectDevice"
-          @refresh="loadState"
-        />
-
-        <AdapterSubmitLogTab
-          v-if="activeTab === 'adapter-log'"
-          :logs="adapterSubmitLogs"
           @refresh="loadState"
         />
 
@@ -984,17 +1070,25 @@ onUnmounted(() => {
           :upstream-options="state.upstream_options"
           :importing="importingAccounts"
           :saving-account-id="savingAccountId"
+          :batch-processing="batchProcessingAccounts"
           @import="handleImportPlatformAccounts"
           @toggle="handleTogglePlatformAccount"
           @delete="handleDeletePlatformAccount"
+          @batch-toggle="handleBatchTogglePlatformAccounts"
+          @batch-delete="handleBatchDeletePlatformAccounts"
         />
 
         <UpstreamConfigTab
           v-if="activeTab === 'upstream'"
           :upstreams="upstreamConfigs"
+          :adapter-state="state.adapter_state ?? null"
+          :adapter-submit-logs="adapterSubmitLogs"
           :saving-upstream-id="savingUpstreamId"
+          :mock-importing="importingMockData"
           @create="handleCreateUpstreamConfig"
           @update="handleUpdateUpstreamConfig"
+          @import-mock-data="handleImportMockData"
+          @refresh-state="loadState"
           @toggle="handleToggleUpstreamConfig"
           @delete="handleDeleteUpstreamConfig"
         />
@@ -1020,6 +1114,7 @@ onUnmounted(() => {
           v-if="activeTab === 'debug'"
           :devices="devices"
           :result="debugResult"
+          :stream-events="debugStreamEvents"
           :running="debugRunning"
           :capture="debugCapture"
           :capturing="debugCapturing"

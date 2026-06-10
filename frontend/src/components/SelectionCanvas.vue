@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { CropRegion } from '../types'
+import { ZoomIn, ZoomOut, FullScreen, Rank, Scissor } from '@element-plus/icons-vue'
 
 const props = defineProps<{
   imageUrl: string
@@ -17,18 +18,79 @@ const emit = defineEmits<{
 }>()
 
 const imageRef = ref<HTMLImageElement | null>(null)
+const boardRef = ref<HTMLElement | null>(null)
+const imageLayerRef = ref<HTMLElement | null>(null)
 const naturalSize = ref({ width: 0, height: 0 })
-const displaySize = ref({ width: 0, height: 0 })
+const scale = ref(1)
+const mode = ref<'select' | 'pan'>('select')
+const isSpaceDown = ref(false)
+
 const draftRect = ref<CropRegion | null>(null)
 const drawing = ref(false)
 let startPoint = { x: 0, y: 0 }
-let resizeObserver: ResizeObserver | null = null
 
-function updateDisplaySize() {
-  if (!imageRef.value) return
-  displaySize.value = {
-    width: imageRef.value.clientWidth,
-    height: imageRef.value.clientHeight,
+let isPanning = false
+let startPanX = 0
+let startPanY = 0
+let startScrollLeft = 0
+let startScrollTop = 0
+
+const displaySize = computed(() => {
+  return {
+    width: naturalSize.value.width * scale.value,
+    height: naturalSize.value.height * scale.value,
+  }
+})
+
+function fitScreen() {
+  if (!boardRef.value || !naturalSize.value.width) return
+  const padding = 24
+  const boardWidth = boardRef.value.clientWidth - padding
+  const boardHeight = boardRef.value.clientHeight - padding
+  const scaleX = boardWidth / naturalSize.value.width
+  const scaleY = boardHeight / naturalSize.value.height
+  scale.value = Math.max(0.1, Math.min(scaleX, scaleY, 1))
+}
+
+function zoomIn() {
+  scale.value = Math.min(scale.value * 1.2, 10)
+}
+
+function zoomOut() {
+  scale.value = Math.max(scale.value / 1.2, 0.1)
+}
+
+function resetZoom() {
+  scale.value = 1
+}
+
+function handleWheel(event: WheelEvent) {
+  if (event.ctrlKey || event.metaKey) {
+    event.preventDefault()
+    const zoomFactor = event.deltaY > 0 ? 0.9 : 1.1
+    const newScale = Math.max(0.1, Math.min(scale.value * zoomFactor, 10))
+    
+    if (boardRef.value && imageRef.value) {
+      const box = imageRef.value.getBoundingClientRect()
+      const pointerX = event.clientX - box.left
+      const pointerY = event.clientY - box.top
+      
+      const oldWidth = box.width
+      const oldHeight = box.height
+      
+      scale.value = newScale
+      
+      const newWidth = naturalSize.value.width * newScale
+      const newHeight = naturalSize.value.height * newScale
+      
+      const dx = (newWidth - oldWidth) * (pointerX / oldWidth)
+      const dy = (newHeight - oldHeight) * (pointerY / oldHeight)
+      
+      boardRef.value.scrollLeft += dx
+      boardRef.value.scrollTop += dy
+    } else {
+      scale.value = newScale
+    }
   }
 }
 
@@ -76,7 +138,7 @@ const ocrStyle = computed(() => toDisplayStyle(props.ocrRect))
 const draftStyle = computed(() => toDisplayStyle(draftRect.value))
 
 function pointerPosition(event: MouseEvent) {
-  const box = imageRef.value?.getBoundingClientRect()
+  const box = imageLayerRef.value?.getBoundingClientRect()
   if (!box) return null
   return {
     x: Math.max(0, Math.min(event.clientX - box.left, box.width)),
@@ -85,14 +147,35 @@ function pointerPosition(event: MouseEvent) {
 }
 
 function handlePointerDown(event: MouseEvent) {
-  const point = pointerPosition(event)
-  if (!point) return
-  drawing.value = true
-  startPoint = point
-  draftRect.value = toNaturalRect(point.x, point.y, point.x, point.y)
+  if (mode.value === 'pan' || isSpaceDown.value || event.button === 1 || event.button === 2) {
+    isPanning = true
+    startPanX = event.clientX
+    startPanY = event.clientY
+    startScrollLeft = boardRef.value?.scrollLeft || 0
+    startScrollTop = boardRef.value?.scrollTop || 0
+    document.body.style.cursor = 'grabbing'
+    event.preventDefault()
+    return
+  }
+
+  if (event.button === 0) {
+    const point = pointerPosition(event)
+    if (!point) return
+    drawing.value = true
+    startPoint = point
+    draftRect.value = toNaturalRect(point.x, point.y, point.x, point.y)
+  }
 }
 
 function handlePointerMove(event: MouseEvent) {
+  if (isPanning) {
+    if (boardRef.value) {
+      boardRef.value.scrollLeft = startScrollLeft - (event.clientX - startPanX)
+      boardRef.value.scrollTop = startScrollTop - (event.clientY - startPanY)
+    }
+    return
+  }
+
   if (!drawing.value) return
   const point = pointerPosition(event)
   if (!point) return
@@ -100,6 +183,12 @@ function handlePointerMove(event: MouseEvent) {
 }
 
 function finishSelection() {
+  if (isPanning) {
+    isPanning = false
+    document.body.style.cursor = ''
+    return
+  }
+
   if (!drawing.value) return
   drawing.value = false
   if (props.activeMode === 'template') {
@@ -118,7 +207,20 @@ function handleImageLoad() {
     width: imageRef.value.naturalWidth,
     height: imageRef.value.naturalHeight,
   }
-  updateDisplaySize()
+  fitScreen()
+}
+
+function handleKeyDown(e: KeyboardEvent) {
+  if (e.code === 'Space' && document.activeElement?.tagName !== 'INPUT' && document.activeElement?.tagName !== 'TEXTAREA') {
+    isSpaceDown.value = true
+    e.preventDefault()
+  }
+}
+
+function handleKeyUp(e: KeyboardEvent) {
+  if (e.code === 'Space') {
+    isSpaceDown.value = false
+  }
 }
 
 watch(
@@ -129,70 +231,124 @@ watch(
 )
 
 onMounted(() => {
-  if (typeof ResizeObserver !== 'undefined') {
-    resizeObserver = new ResizeObserver(() => updateDisplaySize())
-    if (imageRef.value) resizeObserver.observe(imageRef.value)
-  }
   window.addEventListener('mouseup', finishSelection)
+  window.addEventListener('keydown', handleKeyDown)
+  window.addEventListener('keyup', handleKeyUp)
 })
 
 onBeforeUnmount(() => {
-  resizeObserver?.disconnect()
   window.removeEventListener('mouseup', finishSelection)
+  window.removeEventListener('keydown', handleKeyDown)
+  window.removeEventListener('keyup', handleKeyUp)
 })
 </script>
 
 <template>
-  <div class="selection-board">
-    <div class="selection-stage">
-      <img
-        ref="imageRef"
-        :src="imageUrl"
-        alt="调试截图"
-        draggable="false"
-        @load="handleImageLoad"
-        @mousedown.prevent="handlePointerDown"
-        @mousemove.prevent="handlePointerMove"
-      />
-      <div v-if="templateStyle" class="selection-box template" :style="templateStyle">
-        <span>小图区域</span>
+  <div class="selection-canvas-container">
+    <div class="canvas-toolbar">
+      <el-radio-group v-model="mode" size="small">
+        <el-radio-button value="select"><el-icon><Scissor /></el-icon> 框选</el-radio-button>
+        <el-radio-button value="pan"><el-icon><Rank /></el-icon> 拖拽</el-radio-button>
+      </el-radio-group>
+      <el-divider direction="vertical" />
+      <el-button-group size="small">
+        <el-button @click="zoomOut"><el-icon><ZoomOut /></el-icon></el-button>
+        <el-button @click="resetZoom">{{ Math.round(scale * 100) }}%</el-button>
+        <el-button @click="zoomIn"><el-icon><ZoomIn /></el-icon></el-button>
+        <el-button @click="fitScreen"><el-icon><FullScreen /></el-icon></el-button>
+      </el-button-group>
+    </div>
+
+    <div 
+      class="selection-board" 
+      ref="boardRef"
+      @wheel="handleWheel"
+      @contextmenu.prevent
+    >
+      <div class="selection-stage">
+        <div
+          ref="imageLayerRef"
+          class="selection-image-layer"
+          :style="{ width: displaySize.width + 'px', height: displaySize.height + 'px' }"
+          @mousedown.prevent="handlePointerDown"
+          @mousemove.prevent="handlePointerMove"
+        >
+          <img
+            ref="imageRef"
+            :src="imageUrl"
+            alt="调试截图"
+            draggable="false"
+            @load="handleImageLoad"
+            :style="{ width: displaySize.width + 'px', height: displaySize.height + 'px' }"
+          />
+          <div v-if="templateStyle" class="selection-box template" :style="templateStyle">
+            <span>小图区域</span>
+          </div>
+          <div v-if="searchStyle" class="selection-box search" :style="searchStyle">
+            <span>查找区域</span>
+          </div>
+          <div v-if="ocrStyle" class="selection-box ocr" :style="ocrStyle">
+            <span>OCR 区域</span>
+          </div>
+          <div v-if="draftStyle" class="selection-box draft" :style="draftStyle" />
+        </div>
       </div>
-      <div v-if="searchStyle" class="selection-box search" :style="searchStyle">
-        <span>查找区域</span>
-      </div>
-      <div v-if="ocrStyle" class="selection-box ocr" :style="ocrStyle">
-        <span>OCR 区域</span>
-      </div>
-      <div v-if="draftStyle" class="selection-box draft" :style="draftStyle" />
     </div>
   </div>
 </template>
 
 <style scoped>
+.selection-canvas-container {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.canvas-toolbar {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  background: rgba(255, 255, 255, 0.9);
+  backdrop-filter: blur(4px);
+  padding: 6px;
+  border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  border: 1px solid #e2e8f0;
+}
+
 .selection-board {
   width: 100%;
+  height: 520px;
   overflow: auto;
-  padding: 12px;
   border: 1px solid #ebeef5;
   border-radius: 8px;
   background: #f5f7fa;
-  text-align: center;
+  position: relative;
 }
 
 .selection-stage {
   position: relative;
-  display: inline-block;
-  max-width: 100%;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  min-width: 100%;
+  min-height: 100%;
+}
+
+.selection-image-layer {
+  position: relative;
+  flex: 0 0 auto;
 }
 
 .selection-stage img {
   display: block;
-  max-width: 100%;
-  max-height: 520px;
-  width: auto;
-  height: auto;
   cursor: crosshair;
   user-select: none;
+  transform-origin: 0 0;
 }
 
 .selection-box {
@@ -204,10 +360,10 @@ onBeforeUnmount(() => {
 
 .selection-box span {
   position: absolute;
-  left: 0;
+  left: -2px;
   top: -24px;
   padding: 2px 8px;
-  border-radius: 999px;
+  border-radius: 4px;
   font-size: 12px;
   color: #fff;
   white-space: nowrap;

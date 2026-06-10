@@ -13,7 +13,9 @@ async fn main() {
     let app: Router = routes::router().with_state(state);
 
     let addr: SocketAddr = "127.0.0.1:8091".parse().expect("invalid addr");
-    let listener = tokio::net::TcpListener::bind(addr).await.expect("bind failed");
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("bind failed");
 
     println!("adapter-rs listening on http://{}", addr);
     axum::serve(listener, app).await.expect("server failed");

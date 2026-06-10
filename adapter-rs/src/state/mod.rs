@@ -1,4 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -7,19 +9,33 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::models::{
-    AdapterLog, AdapterStateResponse, AdapterSummary, ClientTask, IssuedTaskContext, UpstreamConfig,
-    UpstreamInput, UpstreamStats, UpstreamType,
+    AdapterLog, AdapterSnapshot, AdapterStateResponse, AdapterSummary, CaptureUploadResponse,
+    IssuedTaskContext, MockDataStatus, UpstreamConfig, UpstreamInput, UpstreamStats, UpstreamType,
 };
 
 const LOG_LIMIT: usize = 120;
 const REPORT_LIMIT: usize = 120;
+const SNAPSHOT_LIMIT: usize = 200;
 
 #[derive(Default)]
 pub struct AdapterRuntime {
     pub upstreams: Vec<UpstreamConfig>,
+    pub mock_records: Vec<Value>,
+    pub laoqian_seen_goods_ids: HashSet<String>,
+    pub laoqian_blocked_goods_ids: HashSet<String>,
     pub recent_logs: Vec<AdapterLog>,
     pub recent_reports: Vec<Value>,
+    pub recent_snapshots: Vec<AdapterSnapshot>,
     pub issued_tasks: HashMap<String, IssuedTaskContext>,
+    pub captures: HashMap<String, StoredCapture>,
+    pub mock_imported_total: usize,
+    pub mock_consumed_total: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoredCapture {
+    pub file_name: String,
+    pub path: PathBuf,
 }
 
 #[derive(Clone)]
@@ -39,9 +55,16 @@ impl AppState {
 
         let runtime = AdapterRuntime {
             upstreams: vec![default_mock_upstream(), default_laoqian_upstream()],
+            mock_records: Vec::new(),
+            laoqian_seen_goods_ids: HashSet::new(),
+            laoqian_blocked_goods_ids: HashSet::new(),
             recent_logs: Vec::new(),
             recent_reports: Vec::new(),
+            recent_snapshots: Vec::new(),
             issued_tasks: HashMap::new(),
+            captures: HashMap::new(),
+            mock_imported_total: 0,
+            mock_consumed_total: 0,
         };
 
         let state = Self {
@@ -65,6 +88,12 @@ impl AppState {
             upstreams: runtime.upstreams.clone(),
             recent_logs: runtime.recent_logs.clone(),
             recent_reports: runtime.recent_reports.clone(),
+            mock_data_status: MockDataStatus {
+                imported_total: runtime.mock_imported_total,
+                remaining_total: runtime.mock_records.len(),
+                consumed_total: runtime.mock_consumed_total,
+            },
+            recent_snapshots: runtime.recent_snapshots.clone(),
             summary: AdapterSummary {
                 total_upstreams: runtime.upstreams.len(),
                 enabled_upstreams: runtime.upstreams.iter().filter(|item| item.enabled).count(),
@@ -74,7 +103,97 @@ impl AppState {
     }
 
     pub fn list_upstreams(&self) -> Vec<UpstreamConfig> {
-        self.runtime.read().expect("runtime poisoned").upstreams.clone()
+        self.runtime
+            .read()
+            .expect("runtime poisoned")
+            .upstreams
+            .clone()
+    }
+
+    pub fn import_mock_records(
+        &self,
+        records: Vec<Value>,
+        replace_existing: bool,
+    ) -> (usize, usize) {
+        let mut runtime = self.runtime.write().expect("runtime poisoned");
+        if replace_existing {
+            runtime.mock_records.clear();
+            runtime.mock_consumed_total = 0;
+        }
+        let imported_count = records.len();
+        runtime.mock_records.extend(records);
+        runtime.mock_imported_total += imported_count;
+        let total_count = runtime.mock_records.len();
+        drop(runtime);
+        self.add_log(
+            "已导入本地模拟数据",
+            json!({"imported_count": imported_count, "total_count": total_count, "replace_existing": replace_existing}),
+        );
+        self.add_snapshot(
+            "import_mock_data",
+            "success",
+            Some("mock_local"),
+            None,
+            None,
+            Some("已导入本地模拟数据"),
+            json!({"imported_count": imported_count, "total_count": total_count, "replace_existing": replace_existing}),
+        );
+        (imported_count, total_count)
+    }
+
+    pub fn take_mock_record(&self) -> Option<Value> {
+        let mut runtime = self.runtime.write().expect("runtime poisoned");
+        if runtime.mock_records.is_empty() {
+            return None;
+        }
+        runtime.mock_consumed_total += 1;
+        Some(runtime.mock_records.remove(0))
+    }
+
+    pub fn has_seen_laoqian_goods(&self, goods_id: &str) -> bool {
+        self.runtime
+            .read()
+            .expect("runtime poisoned")
+            .laoqian_seen_goods_ids
+            .contains(goods_id)
+    }
+
+    pub fn remember_laoqian_goods(&self, goods_id: &str) {
+        if goods_id.trim().is_empty() {
+            return;
+        }
+        self.runtime
+            .write()
+            .expect("runtime poisoned")
+            .laoqian_seen_goods_ids
+            .insert(goods_id.trim().to_string());
+    }
+
+    pub fn is_laoqian_goods_blocked(&self, goods_id: &str) -> bool {
+        self.runtime
+            .read()
+            .expect("runtime poisoned")
+            .laoqian_blocked_goods_ids
+            .contains(goods_id)
+    }
+
+    pub fn block_laoqian_goods(&self, goods_id: &str, reason: &str) {
+        let goods_id = goods_id.trim();
+        if goods_id.is_empty() {
+            return;
+        }
+        let inserted = self
+            .runtime
+            .write()
+            .expect("runtime poisoned")
+            .laoqian_blocked_goods_ids
+            .insert(goods_id.to_string());
+        if inserted {
+            self.add_log(
+                "已拉黑老钱 goods_id",
+                json!({"goods_id": goods_id, "reason": reason}),
+            );
+        }
     }
 
     pub fn create_upstream(&self, payload: UpstreamInput) -> UpstreamConfig {
@@ -89,7 +208,11 @@ impl AppState {
         upstream
     }
 
-    pub fn update_upstream(&self, upstream_id: &str, payload: UpstreamInput) -> Result<UpstreamConfig, String> {
+    pub fn update_upstream(
+        &self,
+        upstream_id: &str,
+        payload: UpstreamInput,
+    ) -> Result<UpstreamConfig, String> {
         let mut runtime = self.runtime.write().expect("runtime poisoned");
         let index = runtime
             .upstreams
@@ -100,11 +223,18 @@ impl AppState {
         let updated = build_upstream_config(payload, Some(&current));
         runtime.upstreams[index] = updated.clone();
         drop(runtime);
-        self.add_log("已更新上游配置", json!({"code": updated.code, "base_url": updated.base_url}));
+        self.add_log(
+            "已更新上游配置",
+            json!({"code": updated.code, "base_url": updated.base_url}),
+        );
         Ok(updated)
     }
 
-    pub fn toggle_upstream(&self, upstream_id: &str, enabled: bool) -> Result<UpstreamConfig, String> {
+    pub fn toggle_upstream(
+        &self,
+        upstream_id: &str,
+        enabled: bool,
+    ) -> Result<UpstreamConfig, String> {
         let mut runtime = self.runtime.write().expect("runtime poisoned");
         let upstream = runtime
             .upstreams
@@ -114,7 +244,10 @@ impl AppState {
         upstream.enabled = enabled;
         let updated = upstream.clone();
         drop(runtime);
-        self.add_log("已切换上游启用状态", json!({"code": updated.code, "enabled": enabled}));
+        self.add_log(
+            "已切换上游启用状态",
+            json!({"code": updated.code, "enabled": enabled}),
+        );
         Ok(updated)
     }
 
@@ -152,16 +285,52 @@ impl AppState {
         runtime.recent_reports.truncate(REPORT_LIMIT);
     }
 
+    pub fn add_snapshot(
+        &self,
+        action: &str,
+        status: &str,
+        source_code: Option<&str>,
+        task_id: Option<&str>,
+        upstream_task_ref: Option<&str>,
+        message: Option<&str>,
+        payload: Value,
+    ) {
+        let mut runtime = self.runtime.write().expect("runtime poisoned");
+        runtime.recent_snapshots.insert(
+            0,
+            AdapterSnapshot {
+                id: Uuid::new_v4().simple().to_string(),
+                timestamp: now_string(),
+                action: action.to_string(),
+                status: status.to_string(),
+                source_code: source_code.map(|value| value.to_string()),
+                task_id: task_id.map(|value| value.to_string()),
+                upstream_task_ref: upstream_task_ref.map(|value| value.to_string()),
+                message: message.map(|value| value.to_string()),
+                payload,
+            },
+        );
+        runtime.recent_snapshots.truncate(SNAPSHOT_LIMIT);
+    }
+
     pub fn record_fetch(&self, upstream_code: &str) {
         let mut runtime = self.runtime.write().expect("runtime poisoned");
-        if let Some(upstream) = runtime.upstreams.iter_mut().find(|item| item.code == upstream_code) {
+        if let Some(upstream) = runtime
+            .upstreams
+            .iter_mut()
+            .find(|item| item.code == upstream_code)
+        {
             upstream.stats.fetched_count += 1;
         }
     }
 
     pub fn record_report(&self, upstream_code: &str, success: bool) {
         let mut runtime = self.runtime.write().expect("runtime poisoned");
-        if let Some(upstream) = runtime.upstreams.iter_mut().find(|item| item.code == upstream_code) {
+        if let Some(upstream) = runtime
+            .upstreams
+            .iter_mut()
+            .find(|item| item.code == upstream_code)
+        {
             if success {
                 upstream.stats.reported_success_count += 1;
             } else {
@@ -188,6 +357,40 @@ impl AppState {
         );
         runtime.recent_logs.truncate(LOG_LIMIT);
     }
+
+    pub fn store_capture(
+        &self,
+        file_name: String,
+        bytes: Vec<u8>,
+    ) -> Result<CaptureUploadResponse, String> {
+        let capture_id = self.next_id("capture");
+        let dir = std::env::temp_dir().join("adapter-rs-captures");
+        fs::create_dir_all(&dir).map_err(|err| format!("创建截图目录失败: {err}"))?;
+        let path = dir.join(format!("{capture_id}_{}", sanitize_file_name(&file_name)));
+        fs::write(&path, &bytes).map_err(|err| format!("写入截图失败: {err}"))?;
+
+        let response = CaptureUploadResponse {
+            capture_id: capture_id.clone(),
+            capture_url: format!("http://127.0.0.1:8091/api/captures/{capture_id}"),
+            file_name: file_name.clone(),
+            size: bytes.len(),
+        };
+        let stored = StoredCapture { file_name, path };
+
+        let mut runtime = self.runtime.write().expect("runtime poisoned");
+        runtime.captures.insert(capture_id, stored);
+        drop(runtime);
+        Ok(response)
+    }
+
+    pub fn get_capture(&self, capture_id: &str) -> Option<StoredCapture> {
+        self.runtime
+            .read()
+            .expect("runtime poisoned")
+            .captures
+            .get(capture_id)
+            .cloned()
+    }
 }
 
 fn default_mock_upstream() -> UpstreamConfig {
@@ -202,7 +405,6 @@ fn default_mock_upstream() -> UpstreamConfig {
         fetch_path: None,
         report_success_path: None,
         report_failure_path: None,
-        token: None,
         headers: HashMap::new(),
         notes: Some("默认走适配器内置本地模拟任务，可改成旧模拟服务地址".to_string()),
         created_at: now_string(),
@@ -222,7 +424,6 @@ fn default_laoqian_upstream() -> UpstreamConfig {
         fetch_path: Some("/api/item/fetch".to_string()),
         report_success_path: Some("/api/item/work".to_string()),
         report_failure_path: Some("/api/item/drop".to_string()),
-        token: None,
         headers: HashMap::new(),
         notes: Some("首版保留老钱 provider 与接口骨架".to_string()),
         created_at: now_string(),
@@ -230,33 +431,37 @@ fn default_laoqian_upstream() -> UpstreamConfig {
     }
 }
 
-fn build_upstream_config(payload: UpstreamInput, current: Option<&UpstreamConfig>) -> UpstreamConfig {
-    let (default_name, default_code, fetch_path, success_path, failure_path, default_base_url) = match payload.upstream_type {
-        UpstreamType::MockUpstream => (
-            "本地模拟上游",
-            "mock_upstream",
-            None,
-            None,
-            None,
-            "".to_string(),
-        ),
-        UpstreamType::LaoqianWorker => (
-            "老钱真实上游",
-            "laoqian_worker",
-            Some("/api/item/fetch".to_string()),
-            Some("/api/item/work".to_string()),
-            Some("/api/item/drop".to_string()),
-            "https://frontend.yqlaoqian111.com".to_string(),
-        ),
-        UpstreamType::CustomHttp => (
-            "自定义 HTTP 上游",
-            "custom_http",
-            None,
-            None,
-            None,
-            "".to_string(),
-        ),
-    };
+fn build_upstream_config(
+    payload: UpstreamInput,
+    current: Option<&UpstreamConfig>,
+) -> UpstreamConfig {
+    let (default_name, default_code, fetch_path, success_path, failure_path, default_base_url) =
+        match payload.upstream_type {
+            UpstreamType::MockUpstream => (
+                "本地模拟上游",
+                "mock_upstream",
+                None,
+                None,
+                None,
+                "".to_string(),
+            ),
+            UpstreamType::LaoqianWorker => (
+                "老钱真实上游",
+                "laoqian_worker",
+                Some("/api/item/fetch".to_string()),
+                Some("/api/item/work".to_string()),
+                Some("/api/item/drop".to_string()),
+                "https://frontend.yqlaoqian111.com".to_string(),
+            ),
+            UpstreamType::CustomHttp => (
+                "自定义 HTTP 上游",
+                "custom_http",
+                None,
+                None,
+                None,
+                "".to_string(),
+            ),
+        };
 
     let code = normalize_text(payload.code)
         .or_else(|| current.map(|item| item.code.clone()))
@@ -275,7 +480,11 @@ fn build_upstream_config(payload: UpstreamInput, current: Option<&UpstreamConfig
         enabled: payload.enabled,
         priority: payload.priority,
         base_url: normalize_text(payload.base_url)
-            .or_else(|| current.map(|item| item.base_url.clone()).filter(|item| !item.is_empty()))
+            .or_else(|| {
+                current
+                    .map(|item| item.base_url.clone())
+                    .filter(|item| !item.is_empty())
+            })
             .unwrap_or(default_base_url),
         fetch_path: normalize_text(payload.fetch_path)
             .or_else(|| current.and_then(|item| item.fetch_path.clone()))
@@ -286,7 +495,6 @@ fn build_upstream_config(payload: UpstreamInput, current: Option<&UpstreamConfig
         report_failure_path: normalize_text(payload.report_failure_path)
             .or_else(|| current.and_then(|item| item.report_failure_path.clone()))
             .or(failure_path),
-        token: normalize_text(payload.token).or_else(|| current.and_then(|item| item.token.clone())),
         headers: if payload.headers.is_empty() {
             current.map(|item| item.headers.clone()).unwrap_or_default()
         } else {
@@ -308,5 +516,20 @@ pub fn now_string() -> String {
 }
 
 fn normalize_text(value: Option<String>) -> Option<String> {
-    value.map(|item| item.trim().to_string()).filter(|item| !item.is_empty())
+    value
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+}
+
+fn sanitize_file_name(input: &str) -> String {
+    input
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }

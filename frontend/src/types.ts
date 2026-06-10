@@ -64,6 +64,8 @@ export interface DetailRecord {
   upstream_task_ref?: string | null
   task_mode: string
   device_id: string
+  goods_id?: string | null
+  sku_id?: string | null
   url?: string | null
   status: string
   recognition: string
@@ -98,6 +100,11 @@ export interface PendingTaskRecord {
   account_id?: string | null
   account_name?: string | null
   item_count: number
+  total_item_count?: number | null
+  pending_count?: number | null
+  active_count?: number | null
+  completed_count?: number | null
+  status?: string | null
   prefetched_at?: string | null
 }
 
@@ -176,11 +183,16 @@ export interface UpstreamConfigRecord {
   fetch_path?: string | null
   report_success_path?: string | null
   report_failure_path?: string | null
-  token?: string | null
   headers: Record<string, string>
   notes?: string | null
   created_at: string
   stats: UpstreamConfigStats
+}
+
+export interface MockDataImportResult {
+  imported_count: number
+  total_count: number
+  replace_existing: boolean
 }
 
 export interface ServiceLinkStatus {
@@ -189,6 +201,31 @@ export interface ServiceLinkStatus {
   url: string
   healthy: boolean
   message?: string | null
+}
+
+export interface AdapterMockDataStatus {
+  imported_total: number
+  remaining_total: number
+  consumed_total: number
+}
+
+export interface AdapterSnapshot {
+  id: string
+  timestamp: string
+  action: string
+  status: string
+  source_code?: string | null
+  task_id?: string | null
+  upstream_task_ref?: string | null
+  message?: string | null
+  payload: Record<string, unknown>
+}
+
+export interface AdapterStatePayload {
+  recent_logs: TaskEvent[]
+  recent_reports: Array<Record<string, unknown>>
+  mock_data_status: AdapterMockDataStatus
+  recent_snapshots: AdapterSnapshot[]
 }
 
 export interface DesktopUpdateStatus {
@@ -216,6 +253,7 @@ export interface DashboardState {
   platform_accounts: PlatformAccountRecord[]
   upstream_options: UpstreamOption[]
   service_links: ServiceLinkStatus[]
+  adapter_state?: AdapterStatePayload | null
 }
 
 export interface DebugResult {
@@ -239,6 +277,9 @@ export interface DebugTemplateResult {
     matched_text?: string
     full_text?: string
     expected_tokens?: string[]
+    used_cache?: boolean
+    executed?: boolean
+    ocr_exec_elapsed_ms?: number
     results?: Array<{
       text: string
       confidence: number
@@ -259,6 +300,9 @@ export interface DebugTemplateResult {
     matched_text?: string | null
     full_text?: string | null
     candidate_texts?: string[]
+    ocr_used_cache?: boolean
+    ocr_executed?: boolean
+    ocr_exec_elapsed_ms?: number
   }
 }
 
@@ -269,6 +313,34 @@ export interface DebugTimingSummary {
     loop_count: number
     elapsed_ms: number
   }[]
+}
+
+export interface DebugRunStreamEvent {
+  request_id: string
+  loop_count?: number
+  stage_key?: string
+  stage_name?: string
+  capture_url?: string
+  elapsed_ms?: number
+  request_elapsed_ms?: number
+  template_count?: number
+  task_id?: string
+  mode?: 'url' | 'current'
+  url?: string
+  max_loops?: number
+  message?: string
+  center?: [number, number] | null
+  template_id?: string
+  template_label?: string
+  template_type?: TemplateType
+  recognition_engine?: RecognitionEngine
+  found?: boolean
+  confidence?: number
+  matched_text?: string | null
+  ocr_used_cache?: boolean
+  ocr_executed?: boolean
+  ocr_exec_elapsed_ms?: number
+  result?: DebugResult
 }
 
 export interface TemplateTestResult {

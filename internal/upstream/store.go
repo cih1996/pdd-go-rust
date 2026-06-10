@@ -17,7 +17,6 @@ type Record struct {
 	Enabled      bool      `json:"enabled"`
 	Priority     int       `json:"priority"`
 	BaseURL      string    `json:"base_url"`
-	Token        string    `json:"token,omitempty"`
 	Notes        string    `json:"notes,omitempty"`
 	CreatedAt    time.Time `json:"created_at"`
 	Stats        Stats     `json:"stats"`
@@ -30,7 +29,6 @@ type UpsertRequest struct {
 	Enabled      *bool  `json:"enabled"`
 	Priority     *int   `json:"priority"`
 	BaseURL      string `json:"base_url"`
-	Token        string `json:"token"`
 	Notes        string `json:"notes"`
 }
 
@@ -40,13 +38,20 @@ type Stats struct {
 	ReportedFailureCount int `json:"reported_failure_count"`
 }
 
-type Store struct {
-	mu    sync.RWMutex
-	items []Record
+type Backend interface {
+	LoadUpstreams() ([]Record, error)
+	SaveUpstreams([]Record) error
 }
 
-func NewStore() *Store {
-	return &Store{
+type Store struct {
+	mu      sync.RWMutex
+	items   []Record
+	backend Backend
+}
+
+func NewStore(backend Backend) *Store {
+	store := &Store{
+		backend: backend,
 		items: []Record{
 			{
 				ID:           newID(),
@@ -74,6 +79,14 @@ func NewStore() *Store {
 			},
 		},
 	}
+	if backend != nil {
+		if items, err := backend.LoadUpstreams(); err == nil && len(items) > 0 {
+			store.items = items
+		} else if len(store.items) > 0 {
+			store.persistLocked()
+		}
+	}
+	return store
 }
 
 func (s *Store) List() []Record {
@@ -126,12 +139,12 @@ func (s *Store) Create(payload UpsertRequest) Record {
 		Enabled:      enabled,
 		Priority:     priority,
 		BaseURL:      baseURL,
-		Token:        strings.TrimSpace(payload.Token),
 		Notes:        strings.TrimSpace(payload.Notes),
 		CreatedAt:    time.Now().UTC(),
 		Stats:        Stats{},
 	}
 	s.items = append(s.items, record)
+	s.persistLocked()
 	return record
 }
 
@@ -159,9 +172,9 @@ func (s *Store) Update(id string, payload UpsertRequest) (Record, bool) {
 		if baseURL := strings.TrimSpace(payload.BaseURL); baseURL != "" {
 			updated.BaseURL = baseURL
 		}
-		updated.Token = strings.TrimSpace(payload.Token)
 		updated.Notes = strings.TrimSpace(payload.Notes)
 		s.items[index] = updated
+		s.persistLocked()
 		return updated, true
 	}
 
@@ -177,6 +190,7 @@ func (s *Store) Toggle(id string, enabled bool) (Record, bool) {
 			continue
 		}
 		s.items[index].Enabled = enabled
+		s.persistLocked()
 		return s.items[index], true
 	}
 
@@ -192,10 +206,40 @@ func (s *Store) Delete(id string) bool {
 			continue
 		}
 		s.items = append(s.items[:index], s.items[index+1:]...)
+		s.persistLocked()
 		return true
 	}
 
 	return false
+}
+
+func (s *Store) RecordFetch(code string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, item := range s.items {
+		if item.Code == code {
+			s.items[i].Stats.FetchedCount++
+			s.persistLocked()
+			return
+		}
+	}
+}
+
+func (s *Store) RecordReport(code string, success bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, item := range s.items {
+		if item.Code != code {
+			continue
+		}
+		if success {
+			s.items[i].Stats.ReportedSuccessCount++
+		} else {
+			s.items[i].Stats.ReportedFailureCount++
+		}
+		s.persistLocked()
+		return
+	}
 }
 
 func defaultNameForType(upstreamType string) string {
@@ -219,4 +263,13 @@ func shortID() string {
 		return fmt.Sprintf("%08x", time.Now().UTC().UnixNano())
 	}
 	return hex.EncodeToString(buf)
+}
+
+func (s *Store) persistLocked() {
+	if s.backend == nil {
+		return
+	}
+	items := make([]Record, len(s.items))
+	copy(items, s.items)
+	_ = s.backend.SaveUpstreams(items)
 }

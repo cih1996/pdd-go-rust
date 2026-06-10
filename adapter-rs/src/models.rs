@@ -31,7 +31,6 @@ pub struct UpstreamConfig {
     pub fetch_path: Option<String>,
     pub report_success_path: Option<String>,
     pub report_failure_path: Option<String>,
-    pub token: Option<String>,
     #[serde(default)]
     pub headers: HashMap<String, String>,
     pub notes: Option<String>,
@@ -54,7 +53,6 @@ pub struct UpstreamInput {
     pub fetch_path: Option<String>,
     pub report_success_path: Option<String>,
     pub report_failure_path: Option<String>,
-    pub token: Option<String>,
     #[serde(default)]
     pub headers: HashMap<String, String>,
     pub notes: Option<String>,
@@ -69,6 +67,8 @@ pub struct ToggleUpstreamRequest {
 pub struct ClientTaskItem {
     pub goods_id: String,
     pub sku_id: String,
+    #[serde(default)]
+    pub source_url: Option<String>,
     #[serde(default)]
     pub step_index: i32,
 }
@@ -124,6 +124,14 @@ pub struct ClientSubmitRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaptureUploadResponse {
+    pub capture_id: String,
+    pub capture_url: String,
+    pub file_name: String,
+    pub size: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdapterLog {
     pub id: String,
     pub timestamp: String,
@@ -140,6 +148,27 @@ pub struct AdapterSummary {
     pub recent_reports: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MockDataStatus {
+    pub imported_total: usize,
+    pub remaining_total: usize,
+    pub consumed_total: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdapterSnapshot {
+    pub id: String,
+    pub timestamp: String,
+    pub action: String,
+    pub status: String,
+    pub source_code: Option<String>,
+    pub task_id: Option<String>,
+    pub upstream_task_ref: Option<String>,
+    pub message: Option<String>,
+    #[serde(default)]
+    pub payload: Value,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub success: bool,
@@ -147,21 +176,40 @@ pub struct HealthResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MockDataImportRequest {
+    pub lines: Option<String>,
+    #[serde(default)]
+    pub records: Vec<Value>,
+    #[serde(default)]
+    pub replace_existing: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MockDataImportResponse {
+    pub imported_count: usize,
+    pub total_count: usize,
+    pub replace_existing: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdapterStateResponse {
     pub upstreams: Vec<UpstreamConfig>,
     pub recent_logs: Vec<AdapterLog>,
     pub recent_reports: Vec<Value>,
+    pub mock_data_status: MockDataStatus,
+    pub recent_snapshots: Vec<AdapterSnapshot>,
     pub summary: AdapterSummary,
 }
 
 #[derive(Debug, Clone)]
 pub struct IssuedTaskContext {
     pub task: ClientTask,
-    pub upstream_type: UpstreamType,
     pub item_id: Option<String>,
     pub goods_id: Option<String>,
     pub share_url: Option<String>,
+    pub source_urls: Vec<String>,
     pub laoqian_session_token: Option<String>,
+    pub laoqian_upload_token: Option<String>,
 }
 
 pub fn default_enabled() -> bool {

@@ -1,7 +1,7 @@
 import type {
   DashboardState,
   DebugCaptureResult,
-  DebugResult,
+  MockDataImportResult,
   DebugSelectionTestResult,
   DeviceInfo,
   PlatformAccountRecord,
@@ -11,7 +11,7 @@ import type {
   UpstreamConfigRecord,
 } from './types'
 
-const API_BASE = 'http://127.0.0.1:8080'
+const API_BASE = 'http://127.0.0.1:18080'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, init)
@@ -23,7 +23,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export function getWsUrl(): string {
-  return 'ws://127.0.0.1:8080/ws/events'
+  return 'ws://127.0.0.1:18080/ws/events'
+}
+
+export function sendWsMessage(socket: WebSocket | null | undefined, type: string, data: Record<string, unknown>) {
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    throw new Error('WebSocket 未连接')
+  }
+  socket.send(JSON.stringify({ type, data }))
 }
 
 export function getAssetUrl(path?: string | null): string {
@@ -99,7 +106,6 @@ export function createUpstreamConfig(payload: {
   enabled?: boolean
   priority?: number
   base_url: string
-  token?: string | null
   notes?: string | null
 }): Promise<UpstreamConfigRecord> {
   return request('/api/upstreams', {
@@ -115,7 +121,6 @@ export function updateUpstreamConfig(upstreamId: string, payload: {
   enabled?: boolean
   priority?: number
   base_url: string
-  token?: string | null
   notes?: string | null
 }): Promise<UpstreamConfigRecord> {
   return request(`/api/upstreams/${upstreamId}`, {
@@ -145,6 +150,17 @@ export function importPlatformAccounts(payload: {
   enabled?: boolean
 }): Promise<PlatformAccountRecord[]> {
   return request('/api/platform-accounts/import', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+}
+
+export function importMockData(payload: {
+  lines: string
+  replace_existing?: boolean
+}): Promise<MockDataImportResult> {
+  return request('/api/mock-data/import', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
@@ -198,18 +214,6 @@ export function testTemplate(templateId: string, formData: FormData): Promise<Te
   return request(`/api/templates/${templateId}/test`, {
     method: 'POST',
     body: formData,
-  })
-}
-
-export function runDebug(payload: {
-  device_id: string
-  mode: 'url' | 'current'
-  url?: string
-}): Promise<DebugResult> {
-  return request('/api/debug/run', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
   })
 }
 

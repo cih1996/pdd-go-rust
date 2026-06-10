@@ -13,3 +13,6 @@ frontend/dist-ssr/
 # OS
 .DS_Store
 Thumbs.db
+
+.runtime/
+runtime.db
