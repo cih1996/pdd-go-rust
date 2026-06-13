@@ -12,13 +12,14 @@ import (
 )
 
 type Info struct {
-	ID          string       `json:"id"`
-	Serial      string       `json:"serial"`
-	Status      string       `json:"status"`
-	Connected   bool         `json:"connected"`
-	Running     bool         `json:"running"`
-	Stats       Stats        `json:"stats"`
-	CurrentTask *CurrentTask `json:"current_task,omitempty"`
+	ID                     string       `json:"id"`
+	Serial                 string       `json:"serial"`
+	Status                 string       `json:"status"`
+	Connected              bool         `json:"connected"`
+	Running                bool         `json:"running"`
+	Stats                  Stats        `json:"stats"`
+	CurrentTask            *CurrentTask `json:"current_task,omitempty"`
+	SelectedURLTemplateIDs []string     `json:"selected_url_template_ids,omitempty"`
 }
 
 type Service struct {
@@ -43,14 +44,19 @@ type Stats struct {
 }
 
 type CurrentTask struct {
-	TaskID              string `json:"task_id"`
-	TaskMode            string `json:"task_mode"`
-	StartedAt           string `json:"started_at"`
-	LoopCount           int    `json:"loop_count"`
-	CurrentStage        string `json:"current_stage"`
-	CurrentMessage      string `json:"current_message"`
-	LastMatchedTemplate string `json:"last_matched_template,omitempty"`
-	ClickCaptureURL     string `json:"click_capture_url,omitempty"`
+	TaskID                       string `json:"task_id"`
+	TaskMode                     string `json:"task_mode"`
+	StartedAt                    string `json:"started_at"`
+	LoopCount                    int    `json:"loop_count"`
+	CurrentStage                 string `json:"current_stage"`
+	CurrentMessage               string `json:"current_message"`
+	LastMatchedTemplate          string `json:"last_matched_template,omitempty"`
+	LastMatchedTemplateType      string `json:"last_matched_template_type,omitempty"`
+	LastMatchedRecognitionEngine string `json:"last_matched_recognition_engine,omitempty"`
+	ClickCaptureURL              string `json:"click_capture_url,omitempty"`
+	URLTemplateID                string `json:"url_template_id,omitempty"`
+	URLTemplateIndex             int    `json:"url_template_index,omitempty"`
+	URLTemplateTotal             int    `json:"url_template_total,omitempty"`
 }
 
 func (s *Service) List() []Info {
@@ -58,6 +64,9 @@ func (s *Service) List() []Info {
 	defer s.mu.RUnlock()
 	result := make([]Info, 0, len(s.items))
 	for _, item := range s.items {
+		if len(item.SelectedURLTemplateIDs) > 0 {
+			item.SelectedURLTemplateIDs = append([]string(nil), item.SelectedURLTemplateIDs...)
+		}
 		result = append(result, item)
 	}
 	return result
@@ -114,7 +123,7 @@ func (s *Service) Connect(ctx context.Context, endpoint string) (Info, error) {
 }
 
 func (s *Service) OpenURL(ctx context.Context, serial string, rawURL string) error {
-	_, err := s.runADB(ctx, "-s", serial, "shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", rawURL)
+	_, err := s.runADB(ctx, "-s", serial, "shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", escapeADBURL(rawURL))
 	return err
 }
 
@@ -136,7 +145,10 @@ func (s *Service) Capture(ctx context.Context, serial string) ([]byte, error) {
 		return nil, err
 	}
 	// exec-out returns raw PNG bytes; normalizing CRLF would corrupt the image.
-	return stdout.Bytes(), nil
+	data := stdout.Bytes()
+	cloned := make([]byte, len(data))
+	copy(cloned, data)
+	return cloned, nil
 }
 
 func (s *Service) SetCurrentTask(serial string, task *CurrentTask) {
@@ -175,6 +187,27 @@ func (s *Service) UpdateCurrentTask(serial string, mutate func(*CurrentTask)) {
 	s.items[serial] = item
 }
 
+func (s *Service) UpdateURLTemplateSelection(serial string, templateIDs []string) Info {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	item := s.items[serial]
+	item.ID = serial
+	item.Serial = serial
+	item.SelectedURLTemplateIDs = append([]string(nil), templateIDs...)
+	s.items[serial] = item
+	return item
+}
+
+func (s *Service) SelectedURLTemplateIDs(serial string) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	item := s.items[serial]
+	if len(item.SelectedURLTemplateIDs) == 0 {
+		return nil
+	}
+	return append([]string(nil), item.SelectedURLTemplateIDs...)
+}
+
 func (s *Service) get(serial string) Info {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -194,4 +227,25 @@ func (s *Service) runADB(ctx context.Context, args ...string) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(stdout.String()), nil
+}
+
+func escapeADBURL(rawURL string) string {
+	replacer := strings.NewReplacer(
+		`\\`, `\\\\`,
+		`"`, `\"`,
+		`'`, `\'`,
+		`&`, `\&`,
+		`(`, `\(`,
+		`)`, `\)`,
+		` `, `\ `,
+	)
+	return replacer.Replace(strings.TrimSpace(rawURL))
+}
+
+func BuildOpenURLADBCommand(rawURL string) string {
+	escaped := escapeADBURL(rawURL)
+	if escaped == "" {
+		return ""
+	}
+	return `adb shell am start -a android.intent.action.VIEW -d "` + escaped + `"`
 }

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -364,7 +364,7 @@ impl AppState {
         bytes: Vec<u8>,
     ) -> Result<CaptureUploadResponse, String> {
         let capture_id = self.next_id("capture");
-        let dir = std::env::temp_dir().join("adapter-rs-captures");
+        let dir = capture_storage_dir();
         fs::create_dir_all(&dir).map_err(|err| format!("创建截图目录失败: {err}"))?;
         let path = dir.join(format!("{capture_id}_{}", sanitize_file_name(&file_name)));
         fs::write(&path, &bytes).map_err(|err| format!("写入截图失败: {err}"))?;
@@ -384,12 +384,23 @@ impl AppState {
     }
 
     pub fn get_capture(&self, capture_id: &str) -> Option<StoredCapture> {
-        self.runtime
+        if let Some(capture) = self
+            .runtime
             .read()
             .expect("runtime poisoned")
             .captures
             .get(capture_id)
             .cloned()
+        {
+            return Some(capture);
+        }
+
+        let restored = restore_capture_from_disk(capture_id)?;
+        let mut runtime = self.runtime.write().expect("runtime poisoned");
+        runtime
+            .captures
+            .insert(capture_id.to_string(), restored.clone());
+        Some(restored)
     }
 }
 
@@ -532,4 +543,107 @@ fn sanitize_file_name(input: &str) -> String {
             }
         })
         .collect()
+}
+
+fn capture_storage_dir() -> PathBuf {
+    if let Ok(value) = std::env::var("ADAPTER_CAPTURE_DIR") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+
+    if let Some(base_dir) = default_app_data_dir() {
+        return base_dir.join("adapter-rs").join("captures");
+    }
+
+    std::env::temp_dir().join("adapter-rs-captures")
+}
+
+fn restore_capture_from_disk(capture_id: &str) -> Option<StoredCapture> {
+    for dir in capture_search_dirs() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(file_name) = file_name_string(&path) else {
+                continue;
+            };
+            let prefix = format!("{capture_id}_");
+            if !file_name.starts_with(&prefix) {
+                continue;
+            }
+            let original_name = file_name
+                .split_once('_')
+                .map(|(_, rest)| rest.to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| file_name.clone());
+            return Some(StoredCapture {
+                file_name: original_name,
+                path,
+            });
+        }
+    }
+    None
+}
+
+fn file_name_string(path: &Path) -> Option<String> {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_string())
+}
+
+fn capture_search_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![capture_storage_dir()];
+    if let Ok(current_dir) = std::env::current_dir() {
+        dirs.push(current_dir.join(".runtime").join("captures"));
+    }
+    let legacy_dir = std::env::temp_dir().join("adapter-rs-captures");
+    if !dirs.iter().any(|item| item == &legacy_dir) {
+        dirs.push(legacy_dir);
+    }
+    dirs
+}
+
+fn default_app_data_dir() -> Option<PathBuf> {
+    for key in ["LOCALAPPDATA", "APPDATA"] {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(PathBuf::from(trimmed).join("PddGoRust"));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{capture_storage_dir, restore_capture_from_disk, sanitize_file_name};
+    use std::fs;
+
+    #[test]
+    fn restore_capture_from_disk_finds_existing_capture_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "adapter-rs-capture-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::env::set_var("ADAPTER_CAPTURE_DIR", &dir);
+        fs::create_dir_all(&dir).expect("create capture dir");
+        let capture_id = "capture-123";
+        let file_name = "foo bar.png";
+        let stored_path = dir.join(format!("{capture_id}_{}", sanitize_file_name(file_name)));
+        fs::write(&stored_path, b"test-bytes").expect("write capture");
+
+        let restored = restore_capture_from_disk(capture_id).expect("restore capture from disk");
+        assert_eq!(restored.path, stored_path);
+        assert_eq!(restored.file_name, sanitize_file_name(file_name));
+
+        fs::remove_dir_all(capture_storage_dir()).ok();
+        std::env::remove_var("ADAPTER_CAPTURE_DIR");
+    }
 }

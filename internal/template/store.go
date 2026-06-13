@@ -26,6 +26,8 @@ type Record struct {
 	RecognitionEngine string      `json:"recognition_engine"`
 	Priority          int         `json:"priority"`
 	ExpectedText      string      `json:"expected_text,omitempty"`
+	RequiresClick     bool        `json:"requires_click,omitempty"`
+	MatchOncePerTask  bool        `json:"match_once_per_task,omitempty"`
 	ImageName         string      `json:"image_name,omitempty"`
 	ImageURL          string      `json:"image_url,omitempty"`
 	Threshold         float64     `json:"threshold"`
@@ -43,6 +45,8 @@ type UpsertInput struct {
 	RecognitionEngine string
 	Priority          int
 	ExpectedText      string
+	RequiresClick     bool
+	MatchOncePerTask  bool
 	Threshold         float64
 	Method            string
 	Grayscale         bool
@@ -65,7 +69,14 @@ type Store struct {
 }
 
 func NewStore(backend Backend) *Store {
-	rootDir := filepath.Join(".runtime", "templates")
+	return NewStoreWithRoot(filepath.Join(".runtime", "templates"), backend)
+}
+
+func NewStoreWithRoot(rootDir string, backend Backend) *Store {
+	rootDir = strings.TrimSpace(rootDir)
+	if rootDir == "" {
+		rootDir = filepath.Join(".runtime", "templates")
+	}
 	_ = os.MkdirAll(rootDir, 0o755)
 	store := &Store{
 		items:    []Record{},
@@ -89,19 +100,25 @@ func (s *Store) repairLoadedItems(items []Record) []Record {
 	changed := false
 	fixed := clone(items)
 	for i := range fixed {
-		if strings.TrimSpace(fixed[i].ImageName) == "" {
-			continue
-		}
-		if strings.TrimSpace(fixed[i].ImageURL) == "" {
+		if strings.TrimSpace(fixed[i].ImageName) != "" && strings.TrimSpace(fixed[i].ImageURL) == "" {
 			fixed[i].ImageURL = "/api/assets/templates/" + fixed[i].ImageName
 			changed = true
 		}
-		if strings.TrimSpace(fixed[i].ImagePath) != "" {
-			continue
+		if currentPath := strings.TrimSpace(fixed[i].ImagePath); currentPath != "" {
+			if _, err := os.Stat(currentPath); err != nil {
+				fixed[i].ImagePath = ""
+				changed = true
+			}
 		}
-		candidatePath := filepath.Join(s.imageDir, fixed[i].ImageName)
-		if _, err := os.Stat(candidatePath); err == nil {
-			fixed[i].ImagePath = candidatePath
+		if strings.TrimSpace(fixed[i].ImagePath) == "" && strings.TrimSpace(fixed[i].ImageName) != "" {
+			candidatePath := filepath.Join(s.imageDir, fixed[i].ImageName)
+			if _, err := os.Stat(candidatePath); err == nil {
+				fixed[i].ImagePath = candidatePath
+				changed = true
+			}
+		}
+		if fixed[i].RecognitionEngine == "opencv" && strings.TrimSpace(fixed[i].ImagePath) == "" && fixed[i].Enabled {
+			fixed[i].Enabled = false
 			changed = true
 		}
 	}
@@ -319,6 +336,8 @@ func buildRecord(input UpsertInput, current Record) Record {
 	}
 	record.Priority = input.Priority
 	record.ExpectedText = strings.TrimSpace(input.ExpectedText)
+	record.RequiresClick = input.RequiresClick && record.TemplateType == "fail_release"
+	record.MatchOncePerTask = input.MatchOncePerTask
 	record.Threshold = input.Threshold
 	record.Method = strings.TrimSpace(input.Method)
 	record.Grayscale = input.Grayscale
@@ -338,7 +357,7 @@ func defaultTemplates() []Record {
 			Threshold:         0.8,
 			Method:            "ccoeff_normed",
 			Grayscale:         false,
-			Enabled:           true,
+			Enabled:           false,
 			CreatedAt:         nowString(),
 		},
 		{

@@ -75,6 +75,14 @@ export function stopTasks(deviceIds: string[]): Promise<{ stopped: string[]; mis
   })
 }
 
+export function updateDeviceURLTemplates(deviceId: string, templateIds: string[]): Promise<{ message: string; device: DeviceInfo }> {
+  return request(`/api/devices/${encodeURIComponent(deviceId)}/url-templates`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ template_ids: templateIds }),
+  })
+}
+
 export function exportTemplates(): void {
   window.open(`${API_BASE}/api/templates/export`, '_blank')
 }
@@ -212,6 +220,13 @@ export function moveTemplate(templateId: string, direction: 'up' | 'down'): Prom
 
 export function testTemplate(templateId: string, formData: FormData): Promise<TemplateTestResult> {
   return request(`/api/templates/${templateId}/test`, {
+    method: 'POST',
+    body: formData,
+  })
+}
+
+export function testUnsavedTemplate(formData: FormData): Promise<TemplateTestResult> {
+  return request('/api/templates/test-unsaved', {
     method: 'POST',
     body: formData,
   })

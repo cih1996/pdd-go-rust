@@ -84,14 +84,78 @@ func (d RouterDeps) handleTestTemplate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"template":            record,
-		"match":               result,
-		"capture_url":         captureURL,
-		"recognition_engine":  record.RecognitionEngine,
+		"template":           record,
+		"match":              result,
+		"capture_url":        captureURL,
+		"recognition_engine": record.RecognitionEngine,
 		"ocr_result": map[string]any{
-			"matched_text":   result.MatchedText,
-			"full_text":      result.FullText,
-			"results":        result.OCRResults,
+			"matched_text":    result.MatchedText,
+			"full_text":       result.FullText,
+			"results":         result.OCRResults,
+			"expected_tokens": strings.Split(strings.TrimSpace(record.ExpectedText), "&"),
+		},
+	})
+}
+
+func (d RouterDeps) handleTestUnsavedTemplate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+		return
+	}
+	input, err := parseTemplateInput(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+
+	record := template.Record{
+		ID:                "unsaved-test",
+		Label:             input.Label,
+		TemplateType:      input.TemplateType,
+		RecognitionEngine: input.RecognitionEngine,
+		Threshold:         input.Threshold,
+		Method:            input.Method,
+		ExpectedText:      input.ExpectedText,
+		Grayscale:         input.Grayscale,
+		Crop:              input.Crop,
+	}
+
+	if input.RecognitionEngine == "opencv" {
+		if len(input.ImageBytes) == 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing template image for opencv"})
+			return
+		}
+		tempDir := d.Config.DebugAssetDir
+		_ = os.MkdirAll(tempDir, 0o755)
+		templateName := fmt.Sprintf("unsaved_%d.png", time.Now().UnixNano())
+		templatePath := filepath.Join(tempDir, templateName)
+		if err := os.WriteFile(templatePath, input.ImageBytes, 0o644); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		record.ImageName = templateName
+		record.ImagePath = templatePath
+	}
+
+	imageBytes, captureURL, err := d.debugSourceBytes(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	result, _, err := d.Vision.Match(record, imageBytes, nil)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"template":           record,
+		"match":              result,
+		"capture_url":        captureURL,
+		"recognition_engine": record.RecognitionEngine,
+		"ocr_result": map[string]any{
+			"matched_text":    result.MatchedText,
+			"full_text":       result.FullText,
+			"results":         result.OCRResults,
 			"expected_tokens": strings.Split(strings.TrimSpace(record.ExpectedText), "&"),
 		},
 	})
@@ -114,7 +178,7 @@ func (d RouterDeps) handleDebugCapture(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
-	captureURL, err := saveDebugCapture(bytes)
+	captureURL, err := saveDebugCapture(d.Config.DebugAssetDir, bytes)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
@@ -141,7 +205,7 @@ func (d RouterDeps) handleDebugMatchSelection(w http.ResponseWriter, r *http.Req
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
-	tempDir := filepath.Join(".runtime", "debug")
+	tempDir := d.Config.DebugAssetDir
 	_ = os.MkdirAll(tempDir, 0o755)
 	templateName := fmt.Sprintf("selection_%d.png", time.Now().UnixNano())
 	templatePath := filepath.Join(tempDir, templateName)
@@ -207,9 +271,9 @@ func (d RouterDeps) handleDebugOCRSelection(w http.ResponseWriter, r *http.Reque
 		"match":              result,
 		"search_crop":        record.Crop,
 		"ocr_result": map[string]any{
-			"matched_text":   result.MatchedText,
-			"full_text":      result.FullText,
-			"results":        result.OCRResults,
+			"matched_text":    result.MatchedText,
+			"full_text":       result.FullText,
+			"results":         result.OCRResults,
 			"expected_tokens": strings.Split(record.ExpectedText, "&"),
 		},
 	})
@@ -225,6 +289,8 @@ func parseTemplateInput(r *http.Request) (template.UpsertInput, error) {
 		RecognitionEngine: r.FormValue("recognition_engine"),
 		Priority:          parseIntDefault(r.FormValue("priority"), 100),
 		ExpectedText:      r.FormValue("expected_text"),
+		RequiresClick:     r.FormValue("requires_click") == "true",
+		MatchOncePerTask:  r.FormValue("match_once_per_task") == "true",
 		Threshold:         parseFloatDefault(r.FormValue("threshold"), 0.8),
 		Method:            defaultString(r.FormValue("method"), "ccoeff_normed"),
 		Grayscale:         r.FormValue("grayscale") == "true",
@@ -291,8 +357,11 @@ func defaultString(value string, fallback string) string {
 	return value
 }
 
-func saveDebugCapture(data []byte) (string, error) {
-	dir := filepath.Join(".runtime", "debug")
+func saveDebugCapture(dir string, data []byte) (string, error) {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		dir = filepath.Join(".runtime", "debug")
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
@@ -313,7 +382,7 @@ func (d RouterDeps) debugSourceBytes(r *http.Request) ([]byte, string, error) {
 		if readErr != nil {
 			return nil, "", readErr
 		}
-		url, err := saveDebugCapture(data)
+		url, err := saveDebugCapture(d.Config.DebugAssetDir, data)
 		return data, url, err
 	}
 	deviceID := strings.TrimSpace(r.FormValue("device_id"))
@@ -324,7 +393,7 @@ func (d RouterDeps) debugSourceBytes(r *http.Request) ([]byte, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	url, err := saveDebugCapture(data)
+	url, err := saveDebugCapture(d.Config.DebugAssetDir, data)
 	return data, url, err
 }
 

@@ -7,6 +7,13 @@ const props = defineProps<{
   width?: number | null
   height?: number | null
   label?: string
+  boxes?: Array<{
+    topLeft: [number, number]
+    width: number
+    height: number
+    label?: string
+    tone?: 'primary' | 'secondary'
+  }>
 }>()
 
 const imageRef = ref<HTMLImageElement | null>(null)
@@ -51,6 +58,28 @@ const boxStyle = computed(() => {
   }
 })
 
+const boxStyles = computed(() => {
+  if (
+    !props.boxes?.length ||
+    !naturalSize.value.width ||
+    !naturalSize.value.height ||
+    !displaySize.value.width ||
+    !displaySize.value.height
+  ) {
+    return []
+  }
+  return props.boxes.map((box) => ({
+    label: box.label,
+    tone: box.tone || 'primary',
+    style: {
+      left: `${(box.topLeft[0] / naturalSize.value.width) * displaySize.value.width}px`,
+      top: `${(box.topLeft[1] / naturalSize.value.height) * displaySize.value.height}px`,
+      width: `${(box.width / naturalSize.value.width) * displaySize.value.width}px`,
+      height: `${(box.height / naturalSize.value.height) * displaySize.value.height}px`,
+    },
+  }))
+})
+
 onMounted(() => {
   if (typeof ResizeObserver !== 'undefined') {
     resizeObserver = new ResizeObserver(() => updateDisplaySize())
@@ -67,7 +96,18 @@ onBeforeUnmount(() => {
   <div class="match-preview">
     <div class="match-canvas">
       <img ref="imageRef" :src="imageUrl" alt="识别大图" @load="handleImageLoad" />
-      <div v-if="boxStyle" class="match-box" :style="boxStyle">
+      <template v-if="boxStyles.length">
+        <div
+          v-for="(box, index) in boxStyles"
+          :key="`${box.label || 'box'}-${index}`"
+          class="match-box"
+          :class="box.tone === 'secondary' ? 'match-box-secondary' : 'match-box-primary'"
+          :style="box.style"
+        >
+          <span v-if="box.label" class="match-label">{{ box.label }}</span>
+        </div>
+      </template>
+      <div v-else-if="boxStyle" class="match-box match-box-primary" :style="boxStyle">
         <span v-if="label" class="match-label">{{ label }}</span>
       </div>
     </div>

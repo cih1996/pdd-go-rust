@@ -24,10 +24,14 @@ const form = reactive<SystemConfig>({
 const batchImportDialogVisible = ref(false)
 const batchImportText = ref('')
 const batchImportReplace = ref(false)
+const hasUnsavedChanges = ref(false)
+let syncingFromProps = false
+let lastSyncedSignature = ''
 
-function createUrlTemplateRecord(template = ''): UrlTemplateRecord {
+function createUrlTemplateRecord(template = '', name = ''): UrlTemplateRecord {
   return {
     id: `urltpl_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`,
+    name,
     template,
     trigger_count: 0,
     success_count: 0,
@@ -35,16 +39,55 @@ function createUrlTemplateRecord(template = ''): UrlTemplateRecord {
   }
 }
 
+function normalizedConfigSignature(value: SystemConfig) {
+  return JSON.stringify({
+    open_url_delay_seconds: Number(value.open_url_delay_seconds),
+    click_image_delay_seconds: Number(value.click_image_delay_seconds),
+    max_task_sku_count: Number(value.max_task_sku_count),
+    use_url_templates: Boolean(value.use_url_templates),
+    url_templates: (value.url_templates ?? []).map((item) => ({
+      id: item.id,
+      name: item.name ?? '',
+      template: item.template ?? '',
+      trigger_count: Number(item.trigger_count ?? 0),
+      success_count: Number(item.success_count ?? 0),
+      risk_count: Number(item.risk_count ?? 0),
+    })),
+  })
+}
+
+function applyConfigToForm(value: SystemConfig) {
+  syncingFromProps = true
+  form.open_url_delay_seconds = value.open_url_delay_seconds
+  form.click_image_delay_seconds = value.click_image_delay_seconds
+  form.max_task_sku_count = value.max_task_sku_count
+  form.use_url_templates = value.use_url_templates
+  form.url_templates = value.url_templates.map((item) => ({ ...item }))
+  lastSyncedSignature = normalizedConfigSignature(value)
+  hasUnsavedChanges.value = false
+  syncingFromProps = false
+}
+
 watch(
   () => props.config,
   (value) => {
-    form.open_url_delay_seconds = value.open_url_delay_seconds
-    form.click_image_delay_seconds = value.click_image_delay_seconds
-    form.max_task_sku_count = value.max_task_sku_count
-    form.use_url_templates = value.use_url_templates
-    form.url_templates = value.url_templates.map((item) => ({ ...item }))
+    if (hasUnsavedChanges.value && !props.saving) {
+      return
+    }
+    applyConfigToForm(value)
   },
   { immediate: true, deep: true },
+)
+
+watch(
+  form,
+  () => {
+    if (syncingFromProps) {
+      return
+    }
+    hasUnsavedChanges.value = normalizedConfigSignature(form) !== lastSyncedSignature
+  },
+  { deep: true },
 )
 
 function addUrlTemplate() {
@@ -96,6 +139,7 @@ function submit() {
     url_templates: form.url_templates
       .map((item) => ({
         ...item,
+        name: item.name?.trim() || '',
         template: item.template.trim(),
       }))
       .filter((item) => item.template.length > 0),
@@ -115,6 +159,9 @@ const totalRiskCount = computed(() => form.url_templates.reduce((sum, item) => s
         <p class="page-desc">全局任务流转延迟、风控及跳转 URL 路由规则设置</p>
       </div>
       <div class="header-actions">
+        <el-tag v-if="hasUnsavedChanges" type="warning" effect="light" round class="mr-3">
+          编辑中，自动刷新不会覆盖当前内容
+        </el-tag>
         <el-button type="primary" size="large" :icon="Setting" :loading="saving" @click="submit" class="save-btn">
           保存所有配置
         </el-button>
@@ -235,6 +282,12 @@ const totalRiskCount = computed(() => form.url_templates.reduce((sum, item) => s
                   </div>
                 </div>
                 
+                <el-input
+                  v-model="item.name"
+                  placeholder="模板名称，例如：鞋类登录链路 / 靴子专用 / 默认模板"
+                  class="mb-4"
+                />
+
                 <el-input
                   v-model="item.template"
                   type="textarea"

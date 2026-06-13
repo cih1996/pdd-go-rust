@@ -638,6 +638,7 @@ fn build_mock_task_from_payload(
         account_id: None,
         account_name: None,
         task_items: task_items.clone(),
+        raw_upstream: Some(payload.clone()),
     };
     let context = IssuedTaskContext {
         task: task.clone(),
@@ -706,8 +707,12 @@ fn build_laoqian_task_from_payload(
             );
             message
         })?;
-    let item_id =
-        string_field(item.get("item_id")).ok_or_else(|| "老钱响应缺少 item_id".to_string())?;
+    let item_id = string_field(item.get("item_id")).ok_or_else(|| {
+        format!(
+            "老钱响应缺少 item_id; raw={raw_payload}; item={}",
+            Value::Object(item.clone())
+        )
+    })?;
     let content_raw = string_field(item.get("content")).unwrap_or_else(|| "{}".to_string());
     let content: Value = serde_json::from_str(&content_raw)
         .map_err(|err| format!("老钱 content 解析失败: {err}"))?;
@@ -789,6 +794,7 @@ fn build_laoqian_task_from_payload(
         account_id: None,
         account_name: None,
         task_items: task_items.clone(),
+        raw_upstream: Some(payload.clone()),
     };
     let context = IssuedTaskContext {
         task: task.clone(),
@@ -1151,10 +1157,18 @@ fn upstream_url(upstream: &UpstreamConfig, path: Option<&str>) -> Option<String>
 }
 
 fn string_field(value: Option<&Value>) -> Option<String> {
-    value
-        .and_then(|item| item.as_str())
-        .map(|item| item.trim().to_string())
-        .filter(|item| !item.is_empty())
+    match value? {
+        Value::String(item) => {
+            let trimmed = item.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        Value::Number(item) => Some(item.to_string()),
+        _ => None,
+    }
 }
 
 fn laoqian_business_success(payload: &Value) -> bool {
@@ -1206,7 +1220,10 @@ fn guess_content_type(file_name: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_mock_task_items_from_url;
+    use super::{build_laoqian_task_from_payload, extract_mock_task_items_from_url};
+    use crate::models::UpstreamType;
+    use crate::state::AppState;
+    use serde_json::json;
 
     #[test]
     fn extract_nested_login_url_goods_and_sku_ids() {
@@ -1215,6 +1232,48 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].goods_id, "654097226224");
         assert_eq!(items[0].sku_id, "1888467061279");
+    }
+
+    #[test]
+    fn build_laoqian_task_accepts_numeric_item_id() {
+        let state = AppState::new();
+        let upstream = state
+            .list_upstreams()
+            .into_iter()
+            .find(|item| item.upstream_type == UpstreamType::LaoqianWorker)
+            .expect("laoqian upstream should exist");
+        let payload = json!({
+            "status": 200,
+            "message": "ok",
+            "item": {
+                "item_id": 749844241676087_u64,
+                "content": "{\"spu_id\":\"925751104085\",\"skus\":[{\"source_sku_id\":\"1874695437353\",\"source_url\":\"https://example.com/a\"}]}"
+            }
+        });
+        let raw_payload = payload.to_string();
+
+        let decision = build_laoqian_task_from_payload(
+            &state,
+            &upstream,
+            payload,
+            &raw_payload,
+            "session-token".to_string(),
+            None,
+        )
+        .expect("numeric item_id should be accepted");
+
+        match decision {
+            super::LaoqianFetchDecision::Issue(task, context) => {
+                assert_eq!(task.upstream_task_ref.as_deref(), Some("749844241676087"));
+                assert_eq!(context.item_id.as_deref(), Some("749844241676087"));
+                assert_eq!(task.task_items.len(), 1);
+                assert_eq!(task.task_items[0].goods_id, "925751104085");
+                assert_eq!(task.task_items[0].sku_id, "1874695437353");
+            }
+            super::LaoqianFetchDecision::Drop { reason, .. } => {
+                panic!("expected task issue, got drop: {reason}")
+            }
+        }
     }
 }
 

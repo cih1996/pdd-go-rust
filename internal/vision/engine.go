@@ -2,28 +2,38 @@ package vision
 
 import (
 	"bytes"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"os"
-	"os/exec"
+	"io"
+	"mime/multipart"
+	"net/http"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
-	"unified-server/internal/template"
 
 	"unified-server/internal/config"
+	"unified-server/internal/template"
 )
 
 type Engine struct {
-	cfg config.Config
-	tpl *template.Store
+	cfg    config.Config
+	tpl    *template.Store
+	client *http.Client
 }
+
+const maxOpenCVBatchSize = 10
 
 type OCRResult struct {
 	Text       string   `json:"text"`
 	Confidence float64  `json:"confidence"`
 	Box        [][2]int `json:"box,omitempty"`
+}
+
+type ocrExpectedCondition struct {
+	Text    string
+	Negated bool
 }
 
 type MatchResult struct {
@@ -62,7 +72,15 @@ type Capability struct {
 	Reason          string `json:"reason,omitempty"`
 }
 
-func NewEngine(cfg config.Config, tpl *template.Store) *Engine { return &Engine{cfg: cfg, tpl: tpl} }
+func NewEngine(cfg config.Config, tpl *template.Store) *Engine {
+	return &Engine{
+		cfg: cfg,
+		tpl: tpl,
+		client: &http.Client{
+			Timeout: 15 * time.Second,
+		},
+	}
+}
 
 func (e *Engine) Mode() string {
 	if e.cfg.EnableVisionMock {
@@ -71,19 +89,23 @@ func (e *Engine) Mode() string {
 	return "native"
 }
 
-func (e *Engine) HasOCRTemplates() bool { return e.tpl.CountByEngine("ocr") > 0 }
+func (e *Engine) HasOCRTemplates() bool {
+	return e.tpl.CountByEngine("ocr") > 0
+}
 
 func (e *Engine) Capability() Capability {
 	capability := Capability{
 		GoCVImported: false,
 		Mode:         e.Mode(),
-		Reason:       "本地子进程视觉链路可用时，Go 将直接调用本机 OpenCV/OCR，无需额外 HTTP hop",
+		Reason:       "OpenCV / OCR 通过独立 HTTP 服务提供",
 	}
-	if output, err := exec.Command("python3", "-c", "import cv2; print(cv2.__version__)").CombinedOutput(); err == nil {
+	if output, err := e.fetchOpenCVHealth(); err == nil {
 		capability.OpenCVInstalled = true
-		capability.Reason = strings.TrimSpace(string(output))
+		if text := strings.TrimSpace(output); text != "" {
+			capability.Reason = text
+		}
 	}
-	if _, err := exec.Command("swift", "-e", "import Vision\nimport Foundation\nprint(\"ok\")").CombinedOutput(); err == nil {
+	if _, err := e.fetchOCRHealth(); err == nil {
 		capability.OCRInstalled = true
 	}
 	return capability
@@ -92,32 +114,38 @@ func (e *Engine) Capability() Capability {
 func (e *Engine) Plan() map[string]any {
 	capability := e.Capability()
 	return map[string]any{
-		"opencv":          "target is built into go process",
-		"ocr":             "target is built into go process",
-		"loop_ocr_policy": "run OCR once per loop only when OCR templates exist",
-		"transport":       "no local OCR/OpenCV HTTP hop in final design",
+		"opencv":          "target is provided by external HTTP service",
+		"opencv_base_url": e.cfg.OpenCVBaseURL,
+		"ocr":             "target is provided by external HTTP service",
+		"ocr_base_url":    e.cfg.OCRBaseURL,
+		"loop_ocr_policy": "single loop shared ocr result cache",
+		"transport":       "opencv over HTTP, OCR over HTTP",
 		"capability":      capability,
 	}
 }
 
 type OCRCache struct {
-	Results  []OCRResult
-	FullText string
+	Results          []OCRResult
+	FullText         string
+	OpenCVSourceID   string
+	OpenCVSourceHash string
 }
 
 func (e *Engine) Match(record template.Record, imageBytes []byte, cache *OCRCache) (MatchResult, *OCRCache, error) {
 	start := time.Now()
 	if record.RecognitionEngine == "ocr" {
-		usedCache := cache != nil
+		cache = ensureVisionCache(cache)
+		usedCache := len(cache.Results) > 0 || strings.TrimSpace(cache.FullText) != ""
 		ocrExecuted := false
 		ocrExecElapsedMS := 0.0
-		if cache == nil {
+		if !usedCache {
 			ocrStart := time.Now()
-			next, err := e.runOCR(imageBytes)
+			results, fullText, err := e.runOCR(imageBytes)
 			if err != nil {
 				return MatchResult{}, nil, err
 			}
-			cache = next
+			cache.Results = results
+			cache.FullText = fullText
 			ocrExecuted = true
 			ocrExecElapsedMS = elapsedMillis(ocrStart)
 		}
@@ -128,94 +156,168 @@ func (e *Engine) Match(record template.Record, imageBytes []byte, cache *OCRCach
 		result.OCRExecElapsedMS = ocrExecElapsedMS
 		return result, cache, nil
 	}
-	result, err := e.runOpenCV(record, imageBytes)
+	result, cache, err := e.runOpenCV(record, imageBytes, cache)
 	result.ElapsedMS = elapsedMillis(start)
 	return result, cache, err
 }
 
-func (e *Engine) runOpenCV(record template.Record, imageBytes []byte) (MatchResult, error) {
-	if strings.TrimSpace(record.ImagePath) == "" {
-		return MatchResult{}, fmt.Errorf("opencv template %s missing image path", record.Label)
-	}
-	sourcePath, cleanup, err := writeTempPNG("capture", imageBytes)
-	if err != nil {
-		return MatchResult{}, err
-	}
-	defer cleanup()
-
-	scriptPath := filepath.Join(".runtime", "vision", "opencv_match.py")
-	if err = os.MkdirAll(filepath.Dir(scriptPath), 0o755); err != nil {
-		return MatchResult{}, err
-	}
-	if err = os.WriteFile(scriptPath, []byte(opencvScript), 0o755); err != nil {
-		return MatchResult{}, err
-	}
-
-	args := []string{
-		scriptPath,
-		"--source", sourcePath,
-		"--template", record.ImagePath,
-		"--method", record.Method,
-		"--threshold", fmt.Sprintf("%f", record.Threshold),
-	}
-	if record.Grayscale {
-		args = append(args, "--grayscale", "1")
-	}
-	if record.Crop != nil && record.Crop.Width > 0 && record.Crop.Height > 0 {
-		args = append(args,
-			"--crop-x", strconv.Itoa(record.Crop.X),
-			"--crop-y", strconv.Itoa(record.Crop.Y),
-			"--crop-width", strconv.Itoa(record.Crop.Width),
-			"--crop-height", strconv.Itoa(record.Crop.Height),
-		)
-	}
-	output, err := exec.Command("python3", args...).CombinedOutput()
-	if err != nil {
-		return MatchResult{}, fmt.Errorf("opencv match failed: %s", strings.TrimSpace(string(output)))
-	}
-	var result MatchResult
-	if err := json.Unmarshal(output, &result); err != nil {
-		return MatchResult{}, err
-	}
-	result.Method = record.Method
-	result.Threshold = record.Threshold
-	return result, nil
+func (e *Engine) MatchOpenCVBatch(records []template.Record, imageBytes []byte, cache *OCRCache) (int, MatchResult, *OCRCache, error) {
+	start := time.Now()
+	matchedIndex, result, nextCache, err := e.runOpenCVBatch(records, imageBytes, cache)
+	result.ElapsedMS = elapsedMillis(start)
+	return matchedIndex, result, nextCache, err
 }
 
-func (e *Engine) runOCR(imageBytes []byte) (*OCRCache, error) {
-	sourcePath, cleanup, err := writeTempPNG("ocr", imageBytes)
-	if err != nil {
-		return nil, err
-	}
-	defer cleanup()
+func (e *Engine) runOpenCV(record template.Record, imageBytes []byte, cache *OCRCache) (MatchResult, *OCRCache, error) {
+	_, result, nextCache, err := e.runOpenCVBatch([]template.Record{record}, imageBytes, cache)
+	return result, nextCache, err
+}
 
-	scriptPath := filepath.Join(".runtime", "vision", "vision_ocr.swift")
-	if err := os.MkdirAll(filepath.Dir(scriptPath), 0o755); err != nil {
-		return nil, err
+func (e *Engine) runOpenCVBatch(records []template.Record, imageBytes []byte, cache *OCRCache) (int, MatchResult, *OCRCache, error) {
+	if len(records) == 0 {
+		return -1, MatchResult{}, cache, nil
 	}
-	if err := os.WriteFile(scriptPath, []byte(swiftOCRScript), 0o755); err != nil {
-		return nil, err
-	}
-	cmd := exec.Command("swift", scriptPath, sourcePath)
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		message := strings.TrimSpace(stderr.String())
-		if message == "" {
-			message = err.Error()
+	validRecords := make([]template.Record, 0, len(records))
+	indexMap := make([]int, 0, len(records))
+	for index, record := range records {
+		if record.RecognitionEngine != "opencv" {
+			return -1, MatchResult{}, cache, fmt.Errorf("batch contains non-opencv template %s", record.Label)
 		}
-		return nil, fmt.Errorf("ocr failed: %s", message)
+		if strings.TrimSpace(record.ImagePath) == "" {
+			continue
+		}
+		validRecords = append(validRecords, record)
+		indexMap = append(indexMap, index)
 	}
+	if len(validRecords) == 0 {
+		return -1, MatchResult{
+			Found:     false,
+			Method:    records[0].Method,
+			Threshold: records[0].Threshold,
+		}, cache, nil
+	}
+
+	nextCache, err := e.ensureOpenCVSource(imageBytes, cache)
+	if err != nil {
+		return -1, MatchResult{}, cache, err
+	}
+
+	baseIndex := 0
+	for baseIndex < len(validRecords) {
+		endIndex := baseIndex + maxOpenCVBatchSize
+		if endIndex > len(validRecords) {
+			endIndex = len(validRecords)
+		}
+		chunk := validRecords[baseIndex:endIndex]
+		response, sourceMissing, err := e.requestOpenCVBatch(nextCache.OpenCVSourceID, chunk)
+		if err != nil && sourceMissing {
+			nextCache.OpenCVSourceID = ""
+			nextCache.OpenCVSourceHash = ""
+			nextCache, ensureErr := e.ensureOpenCVSource(imageBytes, nextCache)
+			if ensureErr != nil {
+				return -1, MatchResult{}, cache, ensureErr
+			}
+			response, _, err = e.requestOpenCVBatch(nextCache.OpenCVSourceID, chunk)
+		}
+		if err != nil {
+			return -1, MatchResult{}, cache, err
+		}
+		if len(response.Results) == 0 {
+			return -1, MatchResult{}, nextCache, fmt.Errorf("opencv batch match returned no results")
+		}
+
+		selected := response.Results[len(response.Results)-1]
+		if response.MatchedIndex >= 0 && response.MatchedIndex < len(response.Results) {
+			selected = response.Results[response.MatchedIndex]
+		}
+		result := selected.toMatchResult()
+		if result.Found {
+			return indexMap[baseIndex+response.MatchedIndex], result, nextCache, nil
+		}
+		if baseIndex == 0 {
+			result.Method = chunk[0].Method
+			result.Threshold = chunk[0].Threshold
+		}
+		baseIndex = endIndex
+	}
+	return -1, MatchResult{
+		Found:     false,
+		Method:    validRecords[0].Method,
+		Threshold: validRecords[0].Threshold,
+	}, nextCache, nil
+}
+
+func (e *Engine) runOCR(imageBytes []byte) ([]OCRResult, string, error) {
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("image", "capture.png")
+	if err != nil {
+		return nil, "", err
+	}
+	if _, err := part.Write(imageBytes); err != nil {
+		return nil, "", err
+	}
+	if err := writer.Close(); err != nil {
+		return nil, "", err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(e.cfg.OCRBaseURL, "/")+"/ocr", &body)
+	if err != nil {
+		return nil, "", err
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	resp, err := e.client.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("ocr http request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= http.StatusBadRequest {
+		raw, _ := io.ReadAll(resp.Body)
+		return nil, "", fmt.Errorf("ocr http request failed: %s", strings.TrimSpace(string(raw)))
+	}
+
 	var payload struct {
-		FullText string      `json:"full_text"`
-		Results  []OCRResult `json:"results"`
+		Success  bool   `json:"success"`
+		FullText string `json:"full_text"`
+		Results  []struct {
+			Text        string      `json:"text"`
+			Confidence  float64     `json:"confidence"`
+			BoundingBox [][]float64 `json:"bounding_box"`
+		} `json:"results"`
+		Error string `json:"error"`
 	}
-	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
-		return nil, err
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, "", err
 	}
-	return &OCRCache{Results: payload.Results, FullText: payload.FullText}, nil
+	if !payload.Success && strings.TrimSpace(payload.Error) != "" {
+		return nil, "", fmt.Errorf("ocr failed: %s", strings.TrimSpace(payload.Error))
+	}
+
+	results := make([]OCRResult, 0, len(payload.Results))
+	fullTextParts := make([]string, 0, len(payload.Results))
+	for _, item := range payload.Results {
+		box := make([][2]int, 0, len(item.BoundingBox))
+		for _, point := range item.BoundingBox {
+			if len(point) < 2 {
+				continue
+			}
+			box = append(box, [2]int{int(point[0]), int(point[1])})
+		}
+		results = append(results, OCRResult{
+			Text:       strings.TrimSpace(item.Text),
+			Confidence: item.Confidence,
+			Box:        box,
+		})
+		if text := strings.TrimSpace(item.Text); text != "" {
+			fullTextParts = append(fullTextParts, text)
+		}
+	}
+	fullText := strings.TrimSpace(payload.FullText)
+	if fullText == "" {
+		fullText = strings.Join(fullTextParts, " ")
+	}
+	return results, fullText, nil
 }
 
 func matchOCR(record template.Record, cache *OCRCache) MatchResult {
@@ -235,27 +337,171 @@ func matchOCR(record template.Record, cache *OCRCache) MatchResult {
 		fullTextBuilder.WriteString(item.Text)
 	}
 	fullText := fullTextBuilder.String()
-	tokens := strings.Split(strings.TrimSpace(record.ExpectedText), "&")
+	conditions := parseOCRExpectedConditions(record.ExpectedText)
+	tokens := positiveOCRExpectedTokens(conditions)
 	matched := true
-	for _, token := range tokens {
-		token = strings.TrimSpace(token)
-		if token == "" {
-			continue
+	for _, condition := range conditions {
+		hasToken := ocrTokenMatched(filtered, condition.Text) || strings.Contains(fullText, condition.Text)
+		if condition.Negated && hasToken {
+			matched = false
+			break
 		}
-		if !strings.Contains(fullText, token) && !strings.Contains(cache.FullText, token) {
+		if !condition.Negated && !hasToken {
 			matched = false
 			break
 		}
 	}
-	return MatchResult{
+	matchedItems := selectMatchedOCRResults(filtered, tokens)
+	boxItems := selectPrimaryOCRResults(filtered, tokens)
+	if len(boxItems) == 0 {
+		boxItems = matchedItems
+	}
+	confidenceItems := filtered
+	if matched && len(matchedItems) > 0 {
+		confidenceItems = matchedItems
+	}
+	center, topLeft, width, height, hasBox := aggregateOCRBox(boxItems)
+	result := MatchResult{
 		Found:       matched,
 		Method:      "ocr",
 		Threshold:   record.Threshold,
-		Confidence:  averageConfidence(filtered),
+		Confidence:  averageConfidence(confidenceItems),
 		OCRResults:  filtered,
 		MatchedText: strings.TrimSpace(record.ExpectedText),
 		FullText:    strings.TrimSpace(fullText),
 	}
+	if matched && hasBox {
+		// OCR click templates also need a tappable center in the runtime pipeline.
+		result.Center = center
+		result.TopLeft = topLeft
+		result.Width = width
+		result.Height = height
+	}
+	return result
+}
+
+func selectPrimaryOCRResults(items []OCRResult, tokens []string) []OCRResult {
+	if len(tokens) == 0 {
+		return nil
+	}
+	return selectMatchedOCRResults(items, tokens[:1])
+}
+
+func ocrTokenMatched(items []OCRResult, token string) bool {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return true
+	}
+	for _, item := range items {
+		if strings.Contains(item.Text, token) {
+			return true
+		}
+	}
+	_, _, ok := findOCRTokenWindow(items, token)
+	return ok
+}
+
+func splitExpectedTokens(value string) []string {
+	rawItems := strings.Split(strings.TrimSpace(value), "&")
+	result := make([]string, 0, len(rawItems))
+	for _, item := range rawItems {
+		item = strings.TrimSpace(item)
+		if item != "" {
+			result = append(result, item)
+		}
+	}
+	return result
+}
+
+func parseOCRExpectedConditions(value string) []ocrExpectedCondition {
+	tokens := splitExpectedTokens(value)
+	conditions := make([]ocrExpectedCondition, 0, len(tokens))
+	for _, token := range tokens {
+		item := strings.TrimSpace(token)
+		if item == "" {
+			continue
+		}
+		condition := ocrExpectedCondition{Text: item}
+		if strings.HasPrefix(item, "!") {
+			condition.Negated = true
+			condition.Text = strings.TrimSpace(strings.TrimPrefix(item, "!"))
+		}
+		if condition.Text == "" {
+			continue
+		}
+		conditions = append(conditions, condition)
+	}
+	return conditions
+}
+
+func positiveOCRExpectedTokens(conditions []ocrExpectedCondition) []string {
+	result := make([]string, 0, len(conditions))
+	for _, condition := range conditions {
+		if condition.Negated {
+			continue
+		}
+		result = append(result, condition.Text)
+	}
+	return result
+}
+
+func selectMatchedOCRResults(items []OCRResult, tokens []string) []OCRResult {
+	if len(items) == 0 || len(tokens) == 0 {
+		return nil
+	}
+	selected := make([]OCRResult, 0, len(tokens))
+	selectedIndexes := make(map[int]struct{}, len(tokens))
+	for _, token := range tokens {
+		found := false
+		for index, item := range items {
+			if !strings.Contains(item.Text, token) {
+				continue
+			}
+			if _, exists := selectedIndexes[index]; !exists {
+				selected = append(selected, item)
+				selectedIndexes[index] = struct{}{}
+			}
+			found = true
+		}
+		if found {
+			continue
+		}
+		start, end, ok := findOCRTokenWindow(items, token)
+		if !ok {
+			continue
+		}
+		for index := start; index <= end; index++ {
+			if _, exists := selectedIndexes[index]; exists {
+				continue
+			}
+			selected = append(selected, items[index])
+			selectedIndexes[index] = struct{}{}
+		}
+	}
+	return selected
+}
+
+func findOCRTokenWindow(items []OCRResult, token string) (int, int, bool) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return 0, 0, false
+	}
+	for start := 0; start < len(items); start++ {
+		var joined strings.Builder
+		var joinedWithSpace strings.Builder
+		for end := start; end < len(items); end++ {
+			text := strings.TrimSpace(items[end].Text)
+			joined.WriteString(text)
+			if joinedWithSpace.Len() > 0 && text != "" {
+				joinedWithSpace.WriteString(" ")
+			}
+			joinedWithSpace.WriteString(text)
+			if strings.Contains(joined.String(), token) || strings.Contains(joinedWithSpace.String(), token) {
+				return start, end, true
+			}
+		}
+	}
+	return 0, 0, false
 }
 
 func averageConfidence(items []OCRResult) float64 {
@@ -267,6 +513,271 @@ func averageConfidence(items []OCRResult) float64 {
 		total += item.Confidence
 	}
 	return total / float64(len(items))
+}
+
+func aggregateOCRBox(items []OCRResult) ([2]int, [2]int, int, int, bool) {
+	if len(items) == 0 {
+		return [2]int{}, [2]int{}, 0, 0, false
+	}
+	hasPoint := false
+	minX, minY := 0, 0
+	maxX, maxY := 0, 0
+	for _, item := range items {
+		for _, point := range item.Box {
+			if !hasPoint {
+				minX, maxX = point[0], point[0]
+				minY, maxY = point[1], point[1]
+				hasPoint = true
+				continue
+			}
+			if point[0] < minX {
+				minX = point[0]
+			}
+			if point[0] > maxX {
+				maxX = point[0]
+			}
+			if point[1] < minY {
+				minY = point[1]
+			}
+			if point[1] > maxY {
+				maxY = point[1]
+			}
+		}
+	}
+	if !hasPoint {
+		return [2]int{}, [2]int{}, 0, 0, false
+	}
+	width := maxX - minX
+	height := maxY - minY
+	center := [2]int{minX + width/2, minY + height/2}
+	topLeft := [2]int{minX, minY}
+	return center, topLeft, width, height, true
+}
+
+type openCVSourceUploadResponse struct {
+	SourceID string `json:"source_id"`
+}
+
+type openCVBatchTemplateRequest struct {
+	TemplateID string  `json:"template_id,omitempty"`
+	Path       string  `json:"template_path"`
+	Threshold  float64 `json:"threshold"`
+	Method     string  `json:"method"`
+	Grayscale  bool    `json:"grayscale"`
+	CropX      *int    `json:"crop_x,omitempty"`
+	CropY      *int    `json:"crop_y,omitempty"`
+	CropWidth  *int    `json:"crop_width,omitempty"`
+	CropHeight *int    `json:"crop_height,omitempty"`
+}
+
+type openCVBatchRequest struct {
+	SourceID         string                       `json:"source_id"`
+	StopOnFirstFound bool                         `json:"stop_on_first_found"`
+	Templates        []openCVBatchTemplateRequest `json:"templates"`
+}
+
+type openCVBatchResult struct {
+	TemplateID   string  `json:"template_id,omitempty"`
+	Found        bool    `json:"found"`
+	Confidence   float64 `json:"confidence"`
+	ElapsedMS    float64 `json:"elapsed_ms"`
+	Threshold    float64 `json:"threshold"`
+	Method       string  `json:"method"`
+	TopLeft      []int   `json:"top_left,omitempty"`
+	Center       []int   `json:"center,omitempty"`
+	Width        int     `json:"width,omitempty"`
+	Height       int     `json:"height,omitempty"`
+	SearchRegion []int   `json:"search_region,omitempty"`
+}
+
+type openCVBatchResponse struct {
+	SourceID     string              `json:"source_id"`
+	MatchedIndex int                 `json:"matched_index"`
+	CheckedCount int                 `json:"checked_count"`
+	Results      []openCVBatchResult `json:"results"`
+}
+
+func (r openCVBatchResult) toMatchResult() MatchResult {
+	return MatchResult{
+		Found:      r.Found,
+		Method:     r.Method,
+		Confidence: r.Confidence,
+		Threshold:  r.Threshold,
+		TopLeft:    intPair(r.TopLeft),
+		Center:     intPair(r.Center),
+		Width:      r.Width,
+		Height:     r.Height,
+		ElapsedMS:  r.ElapsedMS,
+	}
+}
+
+func ensureVisionCache(cache *OCRCache) *OCRCache {
+	if cache != nil {
+		return cache
+	}
+	return &OCRCache{}
+}
+
+func (e *Engine) ensureOpenCVSource(imageBytes []byte, cache *OCRCache) (*OCRCache, error) {
+	nextCache := ensureVisionCache(cache)
+	sourceHash := hashBytes(imageBytes)
+	if nextCache.OpenCVSourceID != "" && nextCache.OpenCVSourceHash == sourceHash {
+		return nextCache, nil
+	}
+	sourceID, err := e.uploadOpenCVSource(imageBytes, sourceHash)
+	if err != nil {
+		return nextCache, err
+	}
+	nextCache.OpenCVSourceID = sourceID
+	nextCache.OpenCVSourceHash = sourceHash
+	return nextCache, nil
+}
+
+func (e *Engine) uploadOpenCVSource(imageBytes []byte, sourceKey string) (string, error) {
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("source_image", "capture.png")
+	if err != nil {
+		return "", err
+	}
+	if _, err := part.Write(imageBytes); err != nil {
+		return "", err
+	}
+	if err := writer.WriteField("source_key", sourceKey); err != nil {
+		return "", err
+	}
+	if err := writer.Close(); err != nil {
+		return "", err
+	}
+	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(e.cfg.OpenCVBaseURL, "/")+"/sources", &body)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	resp, err := e.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("upload opencv source failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= http.StatusBadRequest {
+		raw, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("upload opencv source failed: %s", strings.TrimSpace(string(raw)))
+	}
+	var payload openCVSourceUploadResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(payload.SourceID) == "" {
+		return "", fmt.Errorf("upload opencv source failed: missing source_id")
+	}
+	return payload.SourceID, nil
+}
+
+func (e *Engine) requestOpenCVBatch(sourceID string, records []template.Record) (openCVBatchResponse, bool, error) {
+	requestPayload := openCVBatchRequest{
+		SourceID:         sourceID,
+		StopOnFirstFound: true,
+		Templates:        make([]openCVBatchTemplateRequest, 0, len(records)),
+	}
+	for _, record := range records {
+		templatePath := record.ImagePath
+		if !filepath.IsAbs(templatePath) {
+			if absPath, err := filepath.Abs(templatePath); err == nil {
+				templatePath = absPath
+			}
+		}
+		item := openCVBatchTemplateRequest{
+			TemplateID: record.ID,
+			Path:       templatePath,
+			Threshold:  record.Threshold,
+			Method:     record.Method,
+			Grayscale:  record.Grayscale,
+		}
+		if record.Crop != nil && record.Crop.Width > 0 && record.Crop.Height > 0 {
+			item.CropX = &record.Crop.X
+			item.CropY = &record.Crop.Y
+			item.CropWidth = &record.Crop.Width
+			item.CropHeight = &record.Crop.Height
+		}
+		requestPayload.Templates = append(requestPayload.Templates, item)
+	}
+	body, err := json.Marshal(requestPayload)
+	if err != nil {
+		return openCVBatchResponse{}, false, err
+	}
+	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(e.cfg.OpenCVBaseURL, "/")+"/match-batch", bytes.NewReader(body))
+	if err != nil {
+		return openCVBatchResponse{}, false, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := e.client.Do(req)
+	if err != nil {
+		return openCVBatchResponse{}, false, fmt.Errorf("opencv batch match failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= http.StatusBadRequest {
+		raw, _ := io.ReadAll(resp.Body)
+		return openCVBatchResponse{}, resp.StatusCode == http.StatusNotFound, fmt.Errorf("opencv batch match failed: %s", strings.TrimSpace(string(raw)))
+	}
+	var payload openCVBatchResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return openCVBatchResponse{}, false, err
+	}
+	return payload, false, nil
+}
+
+func (e *Engine) fetchOpenCVHealth() (string, error) {
+	req, err := http.NewRequest(http.MethodGet, strings.TrimRight(e.cfg.OpenCVBaseURL, "/")+"/health", nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := e.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= http.StatusBadRequest {
+		raw, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("opencv status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	return string(raw), nil
+}
+
+func (e *Engine) fetchOCRHealth() (string, error) {
+	req, err := http.NewRequest(http.MethodGet, strings.TrimRight(e.cfg.OCRBaseURL, "/")+"/health", nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := e.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= http.StatusBadRequest {
+		raw, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("ocr status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	return string(raw), nil
+}
+
+func hashBytes(data []byte) string {
+	sum := sha1.Sum(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func intPair(values []int) [2]int {
+	if len(values) >= 2 {
+		return [2]int{values[0], values[1]}
+	}
+	return [2]int{}
 }
 
 func boxInCrop(box [][2]int, crop template.CropRegion) bool {
@@ -290,23 +801,6 @@ func boxInCrop(box [][2]int, crop template.CropRegion) bool {
 		}
 	}
 	return minX >= crop.X && minY >= crop.Y && maxX <= crop.X+crop.Width && maxY <= crop.Y+crop.Height
-}
-
-func writeTempPNG(prefix string, data []byte) (string, func(), error) {
-	file, err := os.CreateTemp("", prefix+"-*.png")
-	if err != nil {
-		return "", nil, err
-	}
-	if _, err := file.Write(data); err != nil {
-		_ = file.Close()
-		_ = os.Remove(file.Name())
-		return "", nil, err
-	}
-	if err := file.Close(); err != nil {
-		_ = os.Remove(file.Name())
-		return "", nil, err
-	}
-	return file.Name(), func() { _ = os.Remove(file.Name()) }, nil
 }
 
 func elapsedMillis(startTime time.Time) float64 {
@@ -368,44 +862,4 @@ print(json.dumps({
     "width": int(w),
     "height": int(h),
 }))
-`
-
-const swiftOCRScript = `import Foundation
-import Vision
-
-struct OCRItem: Codable {
-    let text: String
-    let confidence: Double
-    let box: [[Int]]
-}
-
-struct OCRPayload: Codable {
-    let full_text: String
-    let results: [OCRItem]
-}
-
-let path = CommandLine.arguments[1]
-let url = URL(fileURLWithPath: path)
-let request = VNRecognizeTextRequest()
-request.recognitionLevel = .accurate
-let handler = try VNImageRequestHandler(url: url)
-try handler.perform([request])
-let observations = request.results ?? []
-var items: [OCRItem] = []
-var fullText: [String] = []
-for observation in observations {
-    guard let candidate = observation.topCandidates(1).first else { continue }
-    fullText.append(candidate.string)
-    let box = observation.boundingBox
-    let points = [
-        [Int(box.minX * 1000), Int(box.minY * 1000)],
-        [Int(box.maxX * 1000), Int(box.minY * 1000)],
-        [Int(box.maxX * 1000), Int(box.maxY * 1000)],
-        [Int(box.minX * 1000), Int(box.maxY * 1000)],
-    ]
-    items.append(OCRItem(text: candidate.string, confidence: Double(candidate.confidence), box: points))
-}
-let payload = OCRPayload(full_text: fullText.joined(separator: " "), results: items)
-let data = try JSONEncoder().encode(payload)
-FileHandle.standardOutput.write(data)
 `

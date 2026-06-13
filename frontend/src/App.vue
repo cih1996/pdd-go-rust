@@ -23,8 +23,10 @@ import {
   startTasks,
   stopTasks,
   testTemplate,
+  testUnsavedTemplate,
   togglePlatformAccount,
   toggleUpstreamConfig,
+  updateDeviceURLTemplates,
   updateTemplate,
   updateUpstreamConfig,
   updateSystemConfig,
@@ -376,6 +378,17 @@ async function handleStopSingle(deviceId: string) {
   }
 }
 
+async function handleSaveDeviceURLTemplates(payload: { device_id: string; template_ids: string[] }) {
+  try {
+    await updateDeviceURLTemplates(payload.device_id, payload.template_ids)
+    ElMessage.success('设备 URL 模板配置已保存')
+    await loadState()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '保存设备 URL 模板失败'
+    ElMessage.error(errorMessage.value)
+  }
+}
+
 async function handleCreateTemplate(payload: FormData) {
   savingTemplate.value = true
   try {
@@ -461,6 +474,23 @@ async function handleTestTemplate(templateId: string, payload: FormData) {
   testingTemplateId.value = templateId
   try {
     const result = await testTemplate(templateId, payload)
+    templateTestResult.value = {
+      ...result,
+      capture_url: getAssetUrl(result.capture_url),
+    }
+    ElMessage.success('模板测试完成')
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '模板测试失败'
+    ElMessage.error(errorMessage.value)
+  } finally {
+    testingTemplateId.value = ''
+  }
+}
+
+async function handleTestUnsavedTemplate(payload: FormData) {
+  testingTemplateId.value = 'unsaved'
+  try {
+    const result = await testUnsavedTemplate(payload)
     templateTestResult.value = {
       ...result,
       capture_url: getAssetUrl(result.capture_url),
@@ -882,7 +912,7 @@ onUnmounted(() => {
       <div style="padding: 24px 20px; border-bottom: 1px solid #f0f2f5;">
         <div class="header-logo">
           <el-icon :size="28" color="#409EFF"><Monitor /></el-icon>
-          <span>拼多多中控系统</span>
+          <span>任务调度系统</span>
         </div>
         <div style="margin-top: 8px; font-size: 12px; color: #909399;">
           全自动化任务管理平台
@@ -1033,6 +1063,7 @@ onUnmounted(() => {
         <TaskTab
           v-if="activeTab === 'task'"
           :devices="devices"
+          :url-templates="state.system_config.url_templates"
           :event-log="eventLog"
           :details="details"
           :adapter-submit-logs="adapterSubmitLogs"
@@ -1051,6 +1082,7 @@ onUnmounted(() => {
           @start-device="handleStartSingle"
           @stop-device="handleStopSingle"
           @inspect-device="handleInspectDevice"
+          @save-device-url-templates="handleSaveDeviceURLTemplates"
           @refresh="loadState"
         />
 
@@ -1105,8 +1137,10 @@ onUnmounted(() => {
           @update-template="handleUpdateTemplate"
           @delete-template="handleDeleteTemplate"
           @move-template="handleMoveTemplate"
-          @test-template="handleTestTemplate"
-          @export-templates="handleExportTemplates"
+            @test-template="handleTestTemplate"
+            @test-unsaved-template="handleTestUnsavedTemplate"
+            @clear-test-result="templateTestResult = null"
+            @export-templates="handleExportTemplates"
           @import-templates="handleImportTemplates"
         />
 

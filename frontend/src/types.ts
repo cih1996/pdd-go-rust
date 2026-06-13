@@ -16,7 +16,12 @@ export interface TaskProgress {
   current_stage: string
   current_message: string
   last_matched_template?: string | null
+  last_matched_template_type?: TemplateType | null
+  last_matched_recognition_engine?: RecognitionEngine | null
   click_capture_url?: string | null
+  url_template_id?: string | null
+  url_template_index?: number | null
+  url_template_total?: number | null
 }
 
 export interface DeviceInfo {
@@ -25,6 +30,7 @@ export interface DeviceInfo {
   connected: boolean
   running: boolean
   stats: DeviceStats
+  selected_url_template_ids?: string[]
   current_task?: TaskProgress | null
 }
 
@@ -47,6 +53,8 @@ export interface TemplateRecord {
   recognition_engine: RecognitionEngine
   priority: number
   expected_text?: string | null
+  requires_click?: boolean
+  match_once_per_task?: boolean
   image_name?: string | null
   image_url?: string | null
   threshold: number
@@ -75,6 +83,8 @@ export interface DetailRecord {
   message?: string | null
   template_id?: string | null
   template_label?: string | null
+  recognition_engine?: RecognitionEngine | null
+  adb_command?: string | null
 }
 
 export interface TaskEvent {
@@ -99,6 +109,11 @@ export interface PendingTaskRecord {
   source_name?: string | null
   account_id?: string | null
   account_name?: string | null
+  task_items?: Array<{
+    goods_id?: string | null
+    sku_id?: string | null
+    step_index?: number | null
+  }>
   item_count: number
   total_item_count?: number | null
   pending_count?: number | null
@@ -127,6 +142,7 @@ export interface AdapterSubmitLogRecord {
 
 export interface UrlTemplateRecord {
   id: string
+  name?: string | null
   template: string
   trigger_count: number
   success_count: number
@@ -283,6 +299,7 @@ export interface DebugTemplateResult {
     results?: Array<{
       text: string
       confidence: number
+      box?: Array<[number, number]> | number[][]
       bounding_box?: Array<[number, number]> | number[][]
     }>
   } | null

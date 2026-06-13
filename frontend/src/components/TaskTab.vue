@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import type { AdapterSubmitLogRecord, DetailRecord, DeviceInfo, PendingTaskRecord, TaskEvent } from '../types'
+import type { AdapterSubmitLogRecord, DetailRecord, DeviceInfo, PendingTaskRecord, TaskEvent, UrlTemplateRecord } from '../types'
 import { parseApiDate } from '../utils/datetime'
 
 const props = defineProps<{
   devices: DeviceInfo[]
+  urlTemplates: UrlTemplateRecord[]
   eventLog: TaskEvent[]
   details: DetailRecord[]
   adapterSubmitLogs: AdapterSubmitLogRecord[]
@@ -26,6 +27,7 @@ const emit = defineEmits<{
   (event: 'start-device', value: string): void
   (event: 'stop-device', value: string): void
   (event: 'inspect-device', value: string): void
+  (event: 'save-device-url-templates', value: { device_id: string; template_ids: string[] }): void
   (event: 'refresh'): void
 }>()
 
@@ -33,6 +35,9 @@ const searchDevice = ref('')
 const searchLog = ref('')
 const sortMode = ref<'default' | 'duration_desc'>('default')
 const expandedLogId = ref('')
+const deviceTemplateDialogVisible = ref(false)
+const editingDeviceId = ref('')
+const editingDeviceTemplateIDs = ref<string[]>([])
 const TASK_WARNING_SECONDS = 6
 const TASK_DANGER_SECONDS = 10
 
@@ -49,6 +54,38 @@ function taskPriority(row: DeviceInfo) {
   if (elapsed >= TASK_WARNING_SECONDS) return 2
   if (hasActiveTask(row)) return 1
   return 0
+}
+
+function formatURLTemplateProgress(row: DeviceInfo) {
+  const current = row.current_task?.url_template_index ?? 0
+  const total = row.current_task?.url_template_total ?? 0
+  if (!total || !current) return ''
+  return `URL模板 ${current}/${total}`
+}
+
+function selectedURLTemplateCount(row: DeviceInfo) {
+  return row.selected_url_template_ids?.length ?? 0
+}
+
+function openDeviceTemplateDialog(row: DeviceInfo) {
+  editingDeviceId.value = row.serial
+  editingDeviceTemplateIDs.value = [...(row.selected_url_template_ids ?? [])]
+  deviceTemplateDialogVisible.value = true
+}
+
+function saveDeviceTemplateDialog() {
+  emit('save-device-url-templates', {
+    device_id: editingDeviceId.value,
+    template_ids: [...editingDeviceTemplateIDs.value],
+  })
+  deviceTemplateDialogVisible.value = false
+}
+
+function templateDisplayText(item: UrlTemplateRecord, index: number) {
+  const trimmed = item.template.trim()
+  const preview = trimmed.length > 72 ? `${trimmed.slice(0, 72)}...` : trimmed
+  const label = item.name?.trim() || `模板${index + 1}`
+  return `${label} · ${preview}`
 }
 
 const filteredDevices = computed(() => {
@@ -95,6 +132,10 @@ interface TerminalTaskLogItem {
   submit_type?: string | null
   action?: string | null
   error?: string | null
+  template_id?: string | null
+  template_label?: string | null
+  recognition_engine?: 'opencv' | 'ocr' | null
+  adb_command?: string | null
 }
 
 function toTerminalTaskLog(event: TaskEvent): TerminalTaskLogItem | null {
@@ -118,6 +159,13 @@ function toTerminalTaskLog(event: TaskEvent): TerminalTaskLogItem | null {
         ? (payload.report_payload as Record<string, unknown>)
         : null,
     submit_status: '未提交',
+    template_id: typeof payload.template_id === 'string' ? payload.template_id : null,
+    template_label: typeof payload.template_label === 'string' ? payload.template_label : null,
+    recognition_engine:
+      payload.recognition_engine === 'ocr' || payload.recognition_engine === 'opencv'
+        ? payload.recognition_engine
+        : null,
+    adb_command: typeof payload.adb_command === 'string' ? payload.adb_command : null,
   }
 }
 
@@ -152,7 +200,18 @@ function toTerminalTaskLogFromDetail(detail: DetailRecord): TerminalTaskLogItem 
     sku_id: detail.sku_id || '',
     report_payload: null,
     submit_status: '未提交',
+    template_id: detail.template_id || '',
+    template_label: detail.template_label || '',
+    recognition_engine: detail.recognition_engine ?? inferRecognitionEngine(detail),
+    adb_command: detail.adb_command || '',
   }
+}
+
+function inferRecognitionEngine(detail: DetailRecord): 'opencv' | 'ocr' | null {
+  if (!detail.template_label && !detail.template_id) return null
+  const text = `${detail.template_label || ''} ${detail.message || ''}`.toLowerCase()
+  if (text.includes('ocr')) return 'ocr'
+  return 'opencv'
 }
 
 function adapterSubmitStatus(item: AdapterSubmitLogRecord) {
@@ -216,6 +275,10 @@ const filteredLogs = computed(() => {
       item.submit_type,
       String(item.response_status ?? ''),
       item.error,
+      item.template_label,
+      item.template_id,
+      item.recognition_engine,
+      item.adb_command,
     ].some((value) => value?.includes(keyword)),
   )
 })
@@ -246,6 +309,30 @@ function formatStage(stage?: string) {
   return mapping[stage || ''] || stage || '-'
 }
 
+function formatTemplateType(type?: string | null) {
+  const mapping: Record<string, string> = {
+    account_risk: '账号风控',
+    fail_release: '失败释放',
+    click_image: '点击图',
+    success_image: '成功图',
+  }
+  if (!type) return '-'
+  return mapping[type] || type
+}
+
+function currentTaskMatchedTemplateText(row: DeviceInfo) {
+  const task = row.current_task
+  if (!task?.last_matched_template) return ''
+  const parts = [task.last_matched_template]
+  if (task.last_matched_template_type) {
+    parts.push(formatTemplateType(task.last_matched_template_type))
+  }
+  if (task.last_matched_recognition_engine) {
+    parts.push(recognitionEngineLabel(task.last_matched_recognition_engine))
+  }
+  return parts.join(' / ')
+}
+
 function formatDuration(startedAt?: string) {
   const parsed = parseApiDate(startedAt)
   if (!parsed) return '-'
@@ -262,9 +349,19 @@ function queueStatusLabel(status?: string | null) {
   return '候选中'
 }
 
+function pendingTaskItemKey(taskId: string, index: number, goodsId?: string | null, skuId?: string | null) {
+  return `${taskId}-${index}-${goodsId || ''}-${skuId || ''}`
+}
+
 function formatLogPayload(payload?: Record<string, unknown> | null) {
   if (!payload || Object.keys(payload).length === 0) return ''
   return JSON.stringify(payload, null, 2)
+}
+
+function recognitionEngineLabel(engine?: 'opencv' | 'ocr' | null) {
+  if (engine === 'ocr') return 'OCR'
+  if (engine === 'opencv') return '找图'
+  return '-'
 }
 
 function toggleLogExpand(logId: string) {
@@ -421,9 +518,17 @@ onBeforeUnmount(() => {
                   <div class="stage-row">
                     <span class="stage-tag">{{ formatStage(row.current_task.current_stage) }}</span>
                     <span class="loop-tag">第 {{ row.current_task.loop_count }} 轮</span>
+                    <span v-if="formatURLTemplateProgress(row)" class="loop-tag">{{ formatURLTemplateProgress(row) }}</span>
                   </div>
                   <div class="msg-row truncate" :title="row.current_task.current_message">
                     {{ row.current_task.current_message || '-' }}
+                  </div>
+                  <div
+                    v-if="currentTaskMatchedTemplateText(row)"
+                    class="match-row truncate"
+                    :title="currentTaskMatchedTemplateText(row)"
+                  >
+                    最近命中：{{ currentTaskMatchedTemplateText(row) }}
                   </div>
                 </div>
                 <div v-else class="empty-task-cell">当前无派发任务</div>
@@ -449,9 +554,12 @@ onBeforeUnmount(() => {
               </template>
             </el-table-column>
 
-            <el-table-column label="操作" width="140" align="center" fixed="right">
+            <el-table-column label="操作" width="180" align="center" fixed="right">
               <template #default="{ row }">
                 <div class="table-actions">
+                  <el-button link type="info" @click="openDeviceTemplateDialog(row)">
+                    模板{{ selectedURLTemplateCount(row) > 0 ? `(${selectedURLTemplateCount(row)})` : '' }}
+                  </el-button>
                   <el-button link type="primary" @click="emit('inspect-device', row.serial)">查看</el-button>
                   <el-button
                     v-if="!row.running"
@@ -507,6 +615,24 @@ onBeforeUnmount(() => {
                   <div class="qc-row">
                     <span class="qc-label">进度</span>
                     <span class="qc-value">待 {{ task.pending_count ?? task.item_count }} · 中 {{ task.active_count ?? 0 }} · 成 {{ task.completed_count ?? 0 }}</span>
+                  </div>
+                  <div v-if="task.task_items?.length" class="qc-items">
+                    <div class="qc-items-title">任务项</div>
+                    <div
+                      v-for="(item, index) in task.task_items"
+                      :key="pendingTaskItemKey(task.task_id, index, item.goods_id, item.sku_id)"
+                      class="qc-item-row"
+                    >
+                      <span class="qc-item-index">#{{ (item.step_index ?? index) + 1 }}</span>
+                      <span class="qc-item-code">
+                        <span class="qc-item-label">goods_id</span>
+                        <span class="mono-text">{{ item.goods_id || '-' }}</span>
+                      </span>
+                      <span class="qc-item-code">
+                        <span class="qc-item-label">sku_id</span>
+                        <span class="mono-text">{{ item.sku_id || '-' }}</span>
+                      </span>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -570,6 +696,18 @@ onBeforeUnmount(() => {
                         <span class="value">{{ event.recognition_text || '-' }}</span>
                       </div>
                       <div class="lc-detail-item">
+                        <span class="label">模板引擎</span>
+                        <span class="value">{{ recognitionEngineLabel(event.recognition_engine) }}</span>
+                      </div>
+                      <div class="lc-detail-item">
+                        <span class="label">模板名称</span>
+                        <span class="value">{{ event.template_label || '-' }}</span>
+                      </div>
+                      <div class="lc-detail-item">
+                        <span class="label">模板ID</span>
+                        <span class="value mono-text">{{ event.template_id || '-' }}</span>
+                      </div>
+                      <div class="lc-detail-item">
                         <span class="label">提交状态</span>
                         <span class="value">{{ event.submit_status || '-' }}</span>
                       </div>
@@ -595,6 +733,11 @@ onBeforeUnmount(() => {
                       <div class="code-title">上报参数</div>
                       <pre>{{ formatLogPayload(event.report_payload) }}</pre>
                     </div>
+
+                    <div v-if="event.adb_command" class="lc-code-block">
+                      <div class="code-title">ADB命令</div>
+                      <pre>{{ event.adb_command }}</pre>
+                    </div>
                     
                     <div v-if="event.error" class="lc-error-block">
                       {{ event.error }}
@@ -607,6 +750,43 @@ onBeforeUnmount(() => {
         </div>
       </el-col>
     </el-row>
+
+    <el-dialog
+      v-model="deviceTemplateDialogVisible"
+      title="选择设备轮换 URL 模板"
+      width="700px"
+      destroy-on-close
+    >
+      <div class="device-template-dialog">
+        <div class="mb-4 text-sm text-gray">
+          设备：<span class="mono-text">{{ editingDeviceId || '-' }}</span>
+        </div>
+        <el-alert
+          title="只会在勾选的 URL 模板里循环；如果一个都不勾选，则默认使用全部 URL 模板。保存后该设备会从新的第 1 个模板重新开始轮换。"
+          type="info"
+          :closable="false"
+          class="mb-4"
+        />
+        <el-empty v-if="props.urlTemplates.length === 0" description="当前没有可选的 URL 模板" :image-size="72" />
+        <el-checkbox-group v-else v-model="editingDeviceTemplateIDs" class="device-template-group">
+          <el-checkbox
+            v-for="(item, index) in props.urlTemplates"
+            :key="item.id"
+            :label="item.id"
+            class="device-template-option"
+          >
+            <div class="device-template-option-text">
+              <div class="device-template-option-title">{{ item.name?.trim() || `模板 ${index + 1}` }}</div>
+              <div class="device-template-option-preview mono-text" :title="item.template">{{ templateDisplayText(item, index) }}</div>
+            </div>
+          </el-checkbox>
+        </el-checkbox-group>
+      </div>
+      <template #footer>
+        <el-button @click="deviceTemplateDialogVisible = false">取消</el-button>
+        <el-button type="primary" @click="saveDeviceTemplateDialog">保存</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -784,6 +964,11 @@ onBeforeUnmount(() => {
   color: #64748b;
 }
 
+.match-row {
+  font-size: 12px;
+  color: #2563eb;
+}
+
 .empty-task-cell {
   font-size: 12px;
   color: #94a3b8;
@@ -823,6 +1008,47 @@ onBeforeUnmount(() => {
   display: flex;
   gap: 8px;
   justify-content: center;
+}
+
+.device-template-dialog {
+  display: flex;
+  flex-direction: column;
+}
+
+.device-template-group {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 420px;
+  overflow-y: auto;
+}
+
+.device-template-option {
+  margin-right: 0;
+  padding: 10px 12px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.device-template-option-text {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.device-template-option-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #0f172a;
+}
+
+.device-template-option-preview {
+  font-size: 12px;
+  color: #475569;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* Queue Panel */
@@ -898,6 +1124,51 @@ onBeforeUnmount(() => {
 }
 .qc-label { color: #94a3b8; width: 36px; flex-shrink: 0; }
 .qc-value { color: #475569; }
+
+.qc-items {
+  margin-top: 4px;
+  padding-top: 8px;
+  border-top: 1px dashed #e2e8f0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.qc-items-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: #64748b;
+}
+
+.qc-item-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px;
+  border-radius: 6px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+}
+
+.qc-item-index {
+  font-size: 11px;
+  color: #64748b;
+  font-weight: 600;
+}
+
+.qc-item-code {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  font-size: 12px;
+  color: #334155;
+  word-break: break-all;
+}
+
+.qc-item-label {
+  color: #94a3b8;
+  flex-shrink: 0;
+}
 
 /* Logs Panel */
 .logs-panel { flex: 1; }

@@ -35,14 +35,15 @@ type Service struct {
 	runtime  *rt.Store
 	client   *http.Client
 
-	mu              sync.Mutex
-	workers         map[string]context.CancelFunc
-	prefetchCancel  context.CancelFunc
-	candidateCursor int
-	noCandidateWarn bool
-	pending         []pendingTask
-	active          map[string]runningTask
-	groups          map[string]*groupedTask
+	mu               sync.Mutex
+	workers          map[string]context.CancelFunc
+	prefetchCancel   context.CancelFunc
+	candidateCursor  int
+	noCandidateWarn  bool
+	pending          []pendingTask
+	active           map[string]runningTask
+	groups           map[string]*groupedTask
+	urlTemplateState map[string]deviceURLTemplateState
 }
 
 type startRequest struct {
@@ -117,11 +118,26 @@ type runningTask struct {
 }
 
 type skuExecutionResult struct {
-	GoodsID      string
-	SKUID        string
-	Recognition  string
-	Message      string
-	CaptureBytes [][]byte
+	GoodsID           string
+	SKUID             string
+	Recognition       string
+	Message           string
+	CaptureBytes      [][]byte
+	TemplateID        string
+	TemplateLabel     string
+	RecognitionEngine string
+}
+
+type matchedTemplateMeta struct {
+	TemplateID        string
+	TemplateLabel     string
+	TemplateType      string
+	RecognitionEngine string
+}
+
+type deviceURLTemplateState struct {
+	CurrentIndex int
+	RiskedIDs    map[string]struct{}
 }
 
 type groupedTask struct {
@@ -141,18 +157,19 @@ type groupedTask struct {
 
 func NewService(cfg config.Config, hub *ws.Hub, tpl *template.Store, visionEngine *vision.Engine, devices *device.Service, ups *upstream.Store, accounts *account.Store, runtimeStore *rt.Store) *Service {
 	return &Service{
-		cfg:      cfg,
-		hub:      hub,
-		tpl:      tpl,
-		vision:   visionEngine,
-		devices:  devices,
-		upstream: ups,
-		accounts: accounts,
-		runtime:  runtimeStore,
-		client:   &http.Client{Timeout: 30 * time.Second},
-		workers:  map[string]context.CancelFunc{},
-		active:   map[string]runningTask{},
-		groups:   map[string]*groupedTask{},
+		cfg:              cfg,
+		hub:              hub,
+		tpl:              tpl,
+		vision:           visionEngine,
+		devices:          devices,
+		upstream:         ups,
+		accounts:         accounts,
+		runtime:          runtimeStore,
+		client:           &http.Client{Timeout: 30 * time.Second},
+		workers:          map[string]context.CancelFunc{},
+		active:           map[string]runningTask{},
+		groups:           map[string]*groupedTask{},
+		urlTemplateState: map[string]deviceURLTemplateState{},
 	}
 }
 
@@ -165,6 +182,12 @@ func (s *Service) RuntimePlan() map[string]any {
 		"device_total":   len(s.devices.List()),
 		"worker_total":   s.workerCount(),
 	}
+}
+
+func (s *Service) ResetDeviceURLTemplateState(deviceID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.urlTemplateState[deviceID] = newDeviceURLTemplateState()
 }
 
 func (s *Service) Start(deviceIDs []string, mode string) ([]string, []string) {
@@ -180,6 +203,7 @@ func (s *Service) Start(deviceIDs []string, mode string) ([]string, []string) {
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		s.workers[deviceID] = cancel
+		s.urlTemplateState[deviceID] = newDeviceURLTemplateState()
 		started = append(started, deviceID)
 		go s.runWorker(ctx, deviceID, mode)
 	}
@@ -201,6 +225,7 @@ func (s *Service) Stop(deviceIDs []string) ([]string, []string) {
 		}
 		cancel()
 		delete(s.workers, deviceID)
+		delete(s.urlTemplateState, deviceID)
 		stopped = append(stopped, deviceID)
 	}
 	if len(s.workers) == 0 && s.prefetchCancel != nil {
@@ -223,10 +248,15 @@ func (s *Service) runWorker(ctx context.Context, deviceID string, mode string) {
 		CurrentStage:   "idle",
 		CurrentMessage: "等待上游任务",
 	})
+	s.applyCurrentURLTemplateStatus(deviceID)
 	s.emitState()
 
 	defer func() {
+		shouldReleaseAll := s.cleanupWorkerOnExit(deviceID)
 		s.devices.SetCurrentTask(deviceID, nil)
+		if shouldReleaseAll {
+			s.releaseAllGroupedTasks(context.Background(), "cancelled", "全部设备已停止，已主动释放已领取任务")
+		}
 		s.emitEvent("info", "设备任务循环已停止", deviceID, nil)
 		s.emitState()
 	}()
@@ -244,6 +274,7 @@ func (s *Service) runWorker(ctx context.Context, deviceID string, mode string) {
 				current.CurrentStage = "idle"
 				current.CurrentMessage = "暂无任务"
 			})
+			s.applyCurrentURLTemplateStatus(deviceID)
 			s.emitState()
 			time.Sleep(2 * time.Second)
 			continue
@@ -322,10 +353,24 @@ func (s *Service) runWorker(ctx context.Context, deviceID string, mode string) {
 			CurrentStage:   "completed",
 			CurrentMessage: detail.Message,
 		})
+		s.applyCurrentURLTemplateStatus(deviceID)
 		s.emitState()
 		if shouldStop {
-			s.emitEvent("warning", "命中账号风控，设备停止后续任务循环", deviceID, map[string]any{"task_id": taskItem.Task.TaskID})
+			s.devices.UpdateCurrentTask(deviceID, func(current *device.CurrentTask) {
+				current.CurrentStage = "account_risk_stop"
+				current.CurrentMessage = "URL 模板已全部触发风控，设备自动停止"
+			})
+			s.emitState()
+			s.emitEvent("warning", "URL 模板已全部触发风控，设备停止后续任务循环", deviceID, map[string]any{"task_id": taskItem.Task.TaskID})
 			return
+		}
+		if detail.Recognition == "account_risk" {
+			s.devices.UpdateCurrentTask(deviceID, func(current *device.CurrentTask) {
+				current.CurrentStage = "account_risk"
+				current.CurrentMessage = "账号风控，已自动切换到下一个 URL 模板"
+			})
+			s.applyCurrentURLTemplateStatus(deviceID)
+			s.emitState()
 		}
 		time.Sleep(time.Second)
 	}
@@ -335,26 +380,44 @@ func (s *Service) executeTask(ctx context.Context, deviceID string, mode string,
 	systemConfig := s.runtime.SystemConfig()
 	results := make([]skuExecutionResult, 0, len(taskItem.TaskItems))
 	clickTriggered := false
+	lastURLTemplateID := ""
+	lastURL := ""
+	adbCommands := make([]string, 0, len(taskItem.TaskItems))
 
 	for index, item := range taskItem.TaskItems {
-		taskURL := buildTaskURL(systemConfig, item)
+		taskURLSelection := s.selectTaskURLForDevice(deviceID, systemConfig, item)
+		taskURL := taskURLSelection.URL
+		lastURL = taskURL
+		if taskURLSelection.TemplateID != "" {
+			lastURLTemplateID = taskURLSelection.TemplateID
+		}
 		s.devices.UpdateCurrentTask(deviceID, func(current *device.CurrentTask) {
 			current.TaskID = taskItem.TaskID
 			current.TaskMode = mode
 			current.CurrentStage = "open_url"
 			current.CurrentMessage = fmt.Sprintf("处理 SKU %d/%d", index+1, len(taskItem.TaskItems))
 			current.LoopCount = index + 1
+			current.URLTemplateID = taskURLSelection.TemplateID
+			current.URLTemplateIndex = taskURLSelection.TemplateIndex
+			current.URLTemplateTotal = taskURLSelection.TemplateTotal
 		})
 		s.emitState()
 
 		if strings.TrimSpace(taskURL) != "" {
+			adbCommand := device.BuildOpenURLADBCommand(taskURL)
+			if adbCommand != "" {
+				adbCommands = append(adbCommands, adbCommand)
+			}
+			if taskURLSelection.TemplateID != "" {
+				s.runtime.RecordURLTemplateTrigger(taskURLSelection.TemplateID)
+			}
 			if err := s.devices.OpenURL(ctx, deviceID, taskURL); err != nil {
-				return false, false, nil, s.buildDetail(taskItem, &item, deviceID, mode, taskURL, "failure", "open_url_failed", nil, "打开链接失败: "+err.Error())
+				return false, false, nil, s.buildDetail(taskItem, &item, deviceID, mode, taskURL, "failure", "open_url_failed", nil, adbCommand, "打开链接失败: "+err.Error(), nil)
 			}
 			sleepWithContext(ctx, durationFromSeconds(systemConfig.OpenURLDelaySeconds))
 		}
 
-		skuResult, shouldStop, matchedClick, err := s.runTaskUntilTerminal(ctx, deviceID, mode, item, systemConfig)
+		skuResult, shouldStop, matchedClick, matchedMeta, err := s.runTaskUntilTerminal(ctx, deviceID, mode, item, systemConfig)
 		if err != nil {
 			status := "failure"
 			recognition := "loop_failed"
@@ -362,13 +425,22 @@ func (s *Service) executeTask(ctx context.Context, deviceID string, mode string,
 			if strings.HasPrefix(message, "account_risk:") {
 				recognition = "account_risk"
 				message = strings.TrimPrefix(message, "account_risk:")
-				return false, true, results, s.buildDetail(taskItem, &item, deviceID, mode, taskURL, status, recognition, nil, message)
+				if taskURLSelection.TemplateID != "" {
+					s.runtime.RecordURLTemplateRisk(taskURLSelection.TemplateID)
+					if advanced, exhausted := s.advanceDeviceURLTemplateAfterRisk(deviceID, systemConfig, taskURLSelection.TemplateID); advanced {
+						s.applyCurrentURLTemplateStatus(deviceID)
+						shouldStop = exhausted
+					}
+				}
+				message = detailMessageWithTemplate(message, matchedMeta)
+				return false, shouldStop, results, s.buildDetail(taskItem, &item, deviceID, mode, taskURL, status, recognition, nil, strings.TrimSpace(strings.Join(adbCommands, "\n")), message, &matchedMeta)
 			}
 			if strings.HasPrefix(message, "fail_release:") {
 				recognition = "fail_release"
 				message = strings.TrimPrefix(message, "fail_release:")
 			}
-			return false, shouldStop, results, s.buildDetail(taskItem, &item, deviceID, mode, taskURL, status, recognition, nil, message)
+			message = detailMessageWithTemplate(message, matchedMeta)
+			return false, shouldStop, results, s.buildDetail(taskItem, &item, deviceID, mode, taskURL, status, recognition, nil, strings.TrimSpace(strings.Join(adbCommands, "\n")), message, &matchedMeta)
 		}
 		clickTriggered = clickTriggered || matchedClick
 		results = append(results, skuResult)
@@ -378,7 +450,18 @@ func (s *Service) executeTask(ctx context.Context, deviceID string, mode string,
 	if clickTriggered {
 		message = "全部 SKU 识别完成，包含点击图链路"
 	}
-	return true, false, results, s.buildDetail(taskItem, nil, deviceID, mode, buildTaskURL(systemConfig, taskItem.TaskItems[0]), "success", "success_image", nil, message)
+	if lastURLTemplateID != "" {
+		s.runtime.RecordURLTemplateSuccess(lastURLTemplateID)
+	}
+	var meta *matchedTemplateMeta
+	if len(results) > 0 {
+		meta = &matchedTemplateMeta{
+			TemplateID:        results[len(results)-1].TemplateID,
+			TemplateLabel:     results[len(results)-1].TemplateLabel,
+			RecognitionEngine: results[len(results)-1].RecognitionEngine,
+		}
+	}
+	return true, false, results, s.buildDetail(taskItem, nil, deviceID, mode, lastURL, "success", "success_image", nil, strings.TrimSpace(strings.Join(adbCommands, "\n")), message, meta)
 }
 
 func (s *Service) submitTask(ctx context.Context, deviceID string, taskItem clientTask, submitType string, items []clientSubmitTaskItem) error {
@@ -510,7 +593,7 @@ func (s *Service) captureForMode(ctx context.Context, deviceID string, mode stri
 	return s.devices.Capture(ctx, deviceID)
 }
 
-func (s *Service) buildDetail(taskItem clientTask, currentItem *clientTaskItem, deviceID string, mode string, rawURL string, status string, recognition string, captureURLs []string, message string) rt.DetailRecord {
+func (s *Service) buildDetail(taskItem clientTask, currentItem *clientTaskItem, deviceID string, mode string, rawURL string, status string, recognition string, captureURLs []string, adbCommand string, message string, meta *matchedTemplateMeta) rt.DetailRecord {
 	imageCount := 0
 	captureURL := ""
 	if len(captureURLs) > 0 {
@@ -518,7 +601,7 @@ func (s *Service) buildDetail(taskItem clientTask, currentItem *clientTaskItem, 
 		captureURL = captureURLs[len(captureURLs)-1]
 	}
 	goodsID, skuID := detailItemIDs(taskItem, currentItem)
-	return rt.DetailRecord{
+	detail := rt.DetailRecord{
 		TaskID:          taskItem.TaskID,
 		UpstreamTaskRef: taskItem.UpstreamTaskRef,
 		TaskMode:        mode,
@@ -531,8 +614,15 @@ func (s *Service) buildDetail(taskItem clientTask, currentItem *clientTaskItem, 
 		ImageCount:      imageCount,
 		CaptureURL:      captureURL,
 		CaptureURLs:     captureURLs,
+		ADBCommand:      strings.TrimSpace(adbCommand),
 		Message:         message,
 	}
+	if meta != nil {
+		detail.TemplateID = meta.TemplateID
+		detail.TemplateLabel = meta.TemplateLabel
+		detail.RecognitionEngine = meta.RecognitionEngine
+	}
+	return detail
 }
 
 func detailItemIDs(taskItem clientTask, currentItem *clientTaskItem) (string, string) {
@@ -906,6 +996,7 @@ func (s *Service) syncPendingGroupRecord(parentKey string) {
 		UpstreamTaskRef: group.Task.UpstreamTaskRef,
 		SourceCode:      group.Task.SourceCode,
 		SourceName:      group.Task.SourceName,
+		TaskItems:       pendingTaskItemsForRecord(group.Task.TaskItems),
 		ItemCount:       len(group.Pending),
 		TotalItemCount:  group.TotalCount,
 		PendingCount:    len(group.Pending),
@@ -927,6 +1018,18 @@ func (s *Service) syncPendingGroupRecord(parentKey string) {
 		return
 	}
 	s.runtime.SetPendingTask(record)
+}
+
+func pendingTaskItemsForRecord(items []clientTaskItem) []rt.PendingTaskItemRecord {
+	result := make([]rt.PendingTaskItemRecord, 0, len(items))
+	for _, item := range items {
+		result = append(result, rt.PendingTaskItemRecord{
+			GoodsID:   item.GoodsID,
+			SKUID:     item.SKUID,
+			StepIndex: item.StepIndex,
+		})
+	}
+	return result
 }
 
 func (s *Service) groupStatus(group *groupedTask) string {
@@ -1144,18 +1247,20 @@ func (s *Service) uploadFailureEvidence(ctx context.Context, taskItem clientTask
 	}, []string{uploaded.CaptureURL}, nil
 }
 
-func (s *Service) runTaskUntilTerminal(ctx context.Context, deviceID string, mode string, item clientTaskItem, cfg rt.SystemConfig) (skuExecutionResult, bool, bool, error) {
+func (s *Service) runTaskUntilTerminal(ctx context.Context, deviceID string, mode string, item clientTaskItem, cfg rt.SystemConfig) (skuExecutionResult, bool, bool, matchedTemplateMeta, error) {
 	if s.vision.Mode() == "mock" {
 		return skuExecutionResult{
-			GoodsID:      item.GoodsID,
-			SKUID:        item.SKUID,
-			Recognition:  "success_image",
-			Message:      "视觉 mock 模式命中成功图",
-			CaptureBytes: [][]byte{[]byte("mock-capture")},
-		}, false, true, nil
+			GoodsID:           item.GoodsID,
+			SKUID:             item.SKUID,
+			Recognition:       "success_image",
+			Message:           "视觉 mock 模式命中成功图",
+			CaptureBytes:      [][]byte{[]byte("mock-capture")},
+			RecognitionEngine: "opencv",
+		}, false, true, matchedTemplateMeta{}, nil
 	}
 
 	var clickCapture []byte
+	matchedOnceTemplates := make(map[string]struct{})
 	for loop := 1; loop <= 20; loop++ {
 		s.devices.UpdateCurrentTask(deviceID, func(current *device.CurrentTask) {
 			current.LoopCount = loop
@@ -1165,7 +1270,7 @@ func (s *Service) runTaskUntilTerminal(ctx context.Context, deviceID string, mod
 		s.emitState()
 		captureBytes, err := s.captureForMode(ctx, deviceID, mode)
 		if err != nil {
-			return skuExecutionResult{}, false, false, fmt.Errorf("截图失败: %w", err)
+			return skuExecutionResult{}, false, false, matchedTemplateMeta{}, fmt.Errorf("截图失败: %w", err)
 		}
 		cache := (*vision.OCRCache)(nil)
 		s.devices.UpdateCurrentTask(deviceID, func(current *device.CurrentTask) {
@@ -1173,10 +1278,20 @@ func (s *Service) runTaskUntilTerminal(ctx context.Context, deviceID string, mod
 			current.CurrentMessage = "检测账号风控图"
 		})
 		s.emitState()
-		if matched, result, nextCache, err := s.matchStage("account_risk", captureBytes, cache); err != nil {
-			return skuExecutionResult{}, false, false, err
+		if matched, result, matchedTemplate, nextCache, err := s.matchStage("account_risk", captureBytes, cache, len(clickCapture) > 0, matchedOnceTemplates); err != nil {
+			return skuExecutionResult{}, false, false, matchedTemplateMeta{}, err
 		} else if matched {
-			return skuExecutionResult{}, true, false, fmt.Errorf("account_risk:%s", result.MatchedTextOrFallback("命中账号风控"))
+			rememberMatchedTemplate(matchedOnceTemplates, matchedTemplate)
+			meta := templateMetaFromRecord(matchedTemplate)
+			s.devices.UpdateCurrentTask(deviceID, func(current *device.CurrentTask) {
+				current.LastMatchedTemplate = matchedTemplate.Label
+				current.LastMatchedTemplateType = matchedTemplate.TemplateType
+				current.LastMatchedRecognitionEngine = matchedTemplate.RecognitionEngine
+				current.CurrentStage = "account_risk"
+				current.CurrentMessage = currentTaskTemplateMessage(result.MatchedTextOrFallback("命中账号风控"), matchedTemplate)
+			})
+			s.emitState()
+			return skuExecutionResult{}, true, false, meta, fmt.Errorf("account_risk:%s", result.MatchedTextOrFallback("命中账号风控"))
 		} else {
 			cache = nextCache
 		}
@@ -1185,10 +1300,20 @@ func (s *Service) runTaskUntilTerminal(ctx context.Context, deviceID string, mod
 			current.CurrentMessage = "检测失败释放图"
 		})
 		s.emitState()
-		if matched, result, nextCache, err := s.matchStage("fail_release", captureBytes, cache); err != nil {
-			return skuExecutionResult{}, false, false, err
+		if matched, result, matchedTemplate, nextCache, err := s.matchStage("fail_release", captureBytes, cache, len(clickCapture) > 0, matchedOnceTemplates); err != nil {
+			return skuExecutionResult{}, false, false, matchedTemplateMeta{}, err
 		} else if matched {
-			return skuExecutionResult{}, false, false, fmt.Errorf("fail_release:%s", result.MatchedTextOrFallback("命中失败释放"))
+			rememberMatchedTemplate(matchedOnceTemplates, matchedTemplate)
+			meta := templateMetaFromRecord(matchedTemplate)
+			s.devices.UpdateCurrentTask(deviceID, func(current *device.CurrentTask) {
+				current.LastMatchedTemplate = matchedTemplate.Label
+				current.LastMatchedTemplateType = matchedTemplate.TemplateType
+				current.LastMatchedRecognitionEngine = matchedTemplate.RecognitionEngine
+				current.CurrentStage = "fail_release"
+				current.CurrentMessage = currentTaskTemplateMessage(result.MatchedTextOrFallback("命中失败释放"), matchedTemplate)
+			})
+			s.emitState()
+			return skuExecutionResult{}, false, false, meta, fmt.Errorf("fail_release:%s", result.MatchedTextOrFallback("命中失败释放"))
 		} else {
 			cache = nextCache
 		}
@@ -1197,19 +1322,25 @@ func (s *Service) runTaskUntilTerminal(ctx context.Context, deviceID string, mod
 			current.CurrentMessage = "检测点击图"
 		})
 		s.emitState()
-		if matched, result, nextCache, err := s.matchStage("click_image", captureBytes, cache); err != nil {
-			return skuExecutionResult{}, false, false, err
+		if matched, result, matchedTemplate, nextCache, err := s.matchStage("click_image", captureBytes, cache, len(clickCapture) > 0, matchedOnceTemplates); err != nil {
+			return skuExecutionResult{}, false, false, matchedTemplateMeta{}, err
 		} else if matched {
+			rememberMatchedTemplate(matchedOnceTemplates, matchedTemplate)
 			cache = nextCache
-			clickCapture = captureBytes
+			clickCapture = rememberFirstCapture(clickCapture, captureBytes)
 			s.devices.UpdateCurrentTask(deviceID, func(current *device.CurrentTask) {
-				current.LastMatchedTemplate = "click_image"
+				current.LastMatchedTemplate = matchedTemplate.Label
+				current.LastMatchedTemplateType = matchedTemplate.TemplateType
+				current.LastMatchedRecognitionEngine = matchedTemplate.RecognitionEngine
 				current.CurrentStage = "click_action"
-				current.CurrentMessage = fmt.Sprintf("命中点击图，执行点击 (%d,%d)", result.Center[0], result.Center[1])
+				current.CurrentMessage = currentTaskTemplateMessage(
+					fmt.Sprintf("命中模板，执行点击 (%d,%d)", result.Center[0], result.Center[1]),
+					matchedTemplate,
+				)
 			})
 			s.emitState()
 			if err := s.devices.Tap(ctx, deviceID, result.Center[0], result.Center[1]); err != nil {
-				return skuExecutionResult{}, false, false, fmt.Errorf("点击失败: %w", err)
+				return skuExecutionResult{}, false, false, templateMetaFromRecord(matchedTemplate), fmt.Errorf("点击失败: %w", err)
 			}
 			sleepWithContext(ctx, durationFromSeconds(cfg.ClickImageDelaySecond))
 			continue
@@ -1219,25 +1350,32 @@ func (s *Service) runTaskUntilTerminal(ctx context.Context, deviceID string, mod
 			current.CurrentMessage = "检测成功图"
 		})
 		s.emitState()
-		if matched, result, _, err := s.matchStage("success_image", captureBytes, cache); err != nil {
-			return skuExecutionResult{}, false, false, err
+		if matched, result, matchedTemplate, _, err := s.matchStage("success_image", captureBytes, cache, len(clickCapture) > 0, matchedOnceTemplates); err != nil {
+			return skuExecutionResult{}, false, false, matchedTemplateMeta{}, err
 		} else if matched {
+			rememberMatchedTemplate(matchedOnceTemplates, matchedTemplate)
 			s.devices.UpdateCurrentTask(deviceID, func(current *device.CurrentTask) {
 				current.CurrentStage = "success"
-				current.CurrentMessage = result.MatchedTextOrFallback("命中成功图")
+				current.LastMatchedTemplate = matchedTemplate.Label
+				current.LastMatchedTemplateType = matchedTemplate.TemplateType
+				current.LastMatchedRecognitionEngine = matchedTemplate.RecognitionEngine
+				current.CurrentMessage = currentTaskTemplateMessage(result.MatchedTextOrFallback("命中成功图"), matchedTemplate)
 			})
 			s.emitState()
-			captures := [][]byte{captureBytes}
+			captures := [][]byte{cloneBytes(captureBytes)}
 			if len(clickCapture) > 0 {
-				captures = [][]byte{clickCapture, captureBytes}
+				captures = [][]byte{cloneBytes(clickCapture), cloneBytes(captureBytes)}
 			}
 			return skuExecutionResult{
-				GoodsID:      item.GoodsID,
-				SKUID:        item.SKUID,
-				Recognition:  "success_image",
-				Message:      result.MatchedTextOrFallback("命中成功图"),
-				CaptureBytes: captures,
-			}, false, len(clickCapture) > 0, nil
+				GoodsID:           item.GoodsID,
+				SKUID:             item.SKUID,
+				Recognition:       "success_image",
+				Message:           result.MatchedTextOrFallback("命中成功图"),
+				CaptureBytes:      captures,
+				TemplateID:        matchedTemplate.ID,
+				TemplateLabel:     matchedTemplate.Label,
+				RecognitionEngine: matchedTemplate.RecognitionEngine,
+			}, false, len(clickCapture) > 0, templateMetaFromRecord(matchedTemplate), nil
 		}
 		s.devices.UpdateCurrentTask(deviceID, func(current *device.CurrentTask) {
 			current.CurrentStage = "loop_wait"
@@ -1246,23 +1384,343 @@ func (s *Service) runTaskUntilTerminal(ctx context.Context, deviceID string, mod
 		s.emitState()
 		time.Sleep(time.Second)
 	}
-	return skuExecutionResult{}, false, false, fmt.Errorf("fail_release:识别超时")
+	return skuExecutionResult{}, false, false, matchedTemplateMeta{}, fmt.Errorf("fail_release:识别超时")
 }
 
-func (s *Service) matchStage(stage string, captureBytes []byte, cache *vision.OCRCache) (bool, vision.MatchResult, *vision.OCRCache, error) {
-	templates := s.tpl.ListEnabledByType(stage)
+func (s *Service) matchStage(stage string, captureBytes []byte, cache *vision.OCRCache, clickTriggered bool, matchedOnceTemplates map[string]struct{}) (bool, vision.MatchResult, template.Record, *vision.OCRCache, error) {
+	templates := s.filterStageTemplates(stage, clickTriggered, matchedOnceTemplates)
 	currentCache := cache
-	for _, tpl := range templates {
+	for index := 0; index < len(templates); {
+		if templates[index].RecognitionEngine == "opencv" {
+			next := index
+			for next < len(templates) && templates[next].RecognitionEngine == "opencv" {
+				next++
+			}
+			matchedIndex, result, nextCache, err := s.vision.MatchOpenCVBatch(templates[index:next], captureBytes, currentCache)
+			if err != nil {
+				return false, vision.MatchResult{}, template.Record{}, currentCache, err
+			}
+			currentCache = nextCache
+			if matchedIndex >= 0 && result.Found {
+				return true, result, templates[index+matchedIndex], currentCache, nil
+			}
+			index = next
+			continue
+		}
+		tpl := templates[index]
+		index++
 		result, nextCache, err := s.vision.Match(tpl, captureBytes, currentCache)
 		if err != nil {
-			return false, vision.MatchResult{}, currentCache, err
+			return false, vision.MatchResult{}, template.Record{}, currentCache, err
 		}
 		currentCache = nextCache
 		if result.Found {
-			return true, result, currentCache, nil
+			return true, result, tpl, currentCache, nil
 		}
 	}
-	return false, vision.MatchResult{}, currentCache, nil
+	return false, vision.MatchResult{}, template.Record{}, currentCache, nil
+}
+
+func (s *Service) filterStageTemplates(stage string, clickTriggered bool, matchedOnceTemplates map[string]struct{}) []template.Record {
+	templates := s.tpl.ListEnabledByType(stage)
+	filtered := make([]template.Record, 0, len(templates))
+	for _, item := range templates {
+		if item.MatchOncePerTask {
+			if _, exists := matchedOnceTemplates[item.ID]; exists {
+				continue
+			}
+		}
+		if stage == "fail_release" && item.RequiresClick && !clickTriggered {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	return filtered
+}
+
+func rememberMatchedTemplate(matchedOnceTemplates map[string]struct{}, item template.Record) {
+	if !item.MatchOncePerTask {
+		return
+	}
+	if matchedOnceTemplates == nil {
+		return
+	}
+	matchedOnceTemplates[item.ID] = struct{}{}
+}
+
+func cloneBytes(data []byte) []byte {
+	if len(data) == 0 {
+		return nil
+	}
+	cloned := make([]byte, len(data))
+	copy(cloned, data)
+	return cloned
+}
+
+func rememberFirstCapture(existing []byte, current []byte) []byte {
+	if len(existing) > 0 {
+		return existing
+	}
+	return cloneBytes(current)
+}
+
+func templateMetaFromRecord(record template.Record) matchedTemplateMeta {
+	return matchedTemplateMeta{
+		TemplateID:        record.ID,
+		TemplateLabel:     record.Label,
+		TemplateType:      record.TemplateType,
+		RecognitionEngine: record.RecognitionEngine,
+	}
+}
+
+func currentTaskTemplateMessage(message string, record template.Record) string {
+	base := strings.TrimSpace(message)
+	summary := matchedTemplateSummary(templateMetaFromRecord(record))
+	if summary == "" {
+		return base
+	}
+	if base == "" {
+		return "命中模板: " + summary
+	}
+	return base + " [模板: " + summary + "]"
+}
+
+func detailMessageWithTemplate(message string, meta matchedTemplateMeta) string {
+	base := strings.TrimSpace(message)
+	if meta.TemplateLabel == "" && meta.TemplateID == "" {
+		return base
+	}
+	if meta.TemplateLabel != "" && strings.Contains(base, meta.TemplateLabel) {
+		return base
+	}
+	parts := make([]string, 0, 2)
+	if meta.TemplateLabel != "" {
+		parts = append(parts, meta.TemplateLabel)
+	}
+	if meta.TemplateID != "" {
+		parts = append(parts, meta.TemplateID)
+	}
+	if base == "" {
+		return "模板命中: " + strings.Join(parts, " / ")
+	}
+	return base + " [模板: " + strings.Join(parts, " / ") + "]"
+}
+
+func matchedTemplateSummary(meta matchedTemplateMeta) string {
+	parts := make([]string, 0, 3)
+	if meta.TemplateLabel != "" {
+		parts = append(parts, meta.TemplateLabel)
+	}
+	if typeLabel := templateTypeDisplayName(meta.TemplateType); typeLabel != "" {
+		parts = append(parts, typeLabel)
+	}
+	if engineLabel := recognitionEngineDisplayName(meta.RecognitionEngine); engineLabel != "" {
+		parts = append(parts, engineLabel)
+	}
+	return strings.Join(parts, " / ")
+}
+
+func templateTypeDisplayName(templateType string) string {
+	switch strings.TrimSpace(templateType) {
+	case "account_risk":
+		return "账号风控"
+	case "fail_release":
+		return "失败释放"
+	case "click_image":
+		return "点击图"
+	case "success_image":
+		return "成功图"
+	default:
+		return strings.TrimSpace(templateType)
+	}
+}
+
+func recognitionEngineDisplayName(engine string) string {
+	switch strings.TrimSpace(engine) {
+	case "ocr":
+		return "OCR"
+	case "opencv":
+		return "找图"
+	default:
+		return strings.TrimSpace(engine)
+	}
+}
+
+type taskURLSelection struct {
+	URL           string
+	TemplateID    string
+	TemplateIndex int
+	TemplateTotal int
+}
+
+func newDeviceURLTemplateState() deviceURLTemplateState {
+	return deviceURLTemplateState{
+		CurrentIndex: 0,
+		RiskedIDs:    map[string]struct{}{},
+	}
+}
+
+func (s *Service) cleanupWorkerOnExit(deviceID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.urlTemplateState, deviceID)
+	if _, exists := s.workers[deviceID]; !exists {
+		return false
+	}
+	delete(s.workers, deviceID)
+	if len(s.workers) == 0 && s.prefetchCancel != nil {
+		s.prefetchCancel()
+		s.prefetchCancel = nil
+		return true
+	}
+	return false
+}
+
+func (s *Service) applyCurrentURLTemplateStatus(deviceID string) {
+	cfg := s.runtime.SystemConfig()
+	activeTemplates := s.activeURLTemplatesForDevice(deviceID, cfg)
+	index, total, templateID := s.currentDeviceURLTemplateStatus(deviceID, activeTemplates)
+	s.devices.UpdateCurrentTask(deviceID, func(current *device.CurrentTask) {
+		current.URLTemplateID = templateID
+		current.URLTemplateIndex = index
+		current.URLTemplateTotal = total
+	})
+}
+
+func (s *Service) currentDeviceURLTemplateStatus(deviceID string, activeTemplates []rt.URLTemplateRecord) (int, int, string) {
+	if len(activeTemplates) == 0 {
+		return 0, 0, ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := s.urlTemplateState[deviceID]
+	nextIndex := resolveDeviceURLTemplateIndex(state, activeTemplates)
+	if nextIndex < 0 {
+		return 0, len(activeTemplates), ""
+	}
+	state.CurrentIndex = nextIndex
+	s.urlTemplateState[deviceID] = state
+	return nextIndex + 1, len(activeTemplates), activeTemplates[nextIndex].ID
+}
+
+func (s *Service) selectTaskURLForDevice(deviceID string, cfg rt.SystemConfig, item clientTaskItem) taskURLSelection {
+	activeTemplates := s.activeURLTemplatesForDevice(deviceID, cfg)
+	if !cfg.UseURLTemplates || len(activeTemplates) == 0 {
+		return taskURLSelection{
+			URL: fmt.Sprintf("https://mobile.yangkeduo.com/order_checkout.html?goods_id=%s&sku_id=%s", item.GoodsID, item.SKUID),
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := s.urlTemplateState[deviceID]
+	nextIndex := resolveDeviceURLTemplateIndex(state, activeTemplates)
+	if nextIndex < 0 {
+		return taskURLSelection{
+			URL:           fmt.Sprintf("https://mobile.yangkeduo.com/order_checkout.html?goods_id=%s&sku_id=%s", item.GoodsID, item.SKUID),
+			TemplateTotal: len(activeTemplates),
+		}
+	}
+	state.CurrentIndex = nextIndex
+	s.urlTemplateState[deviceID] = state
+	tpl := activeTemplates[nextIndex]
+	return taskURLSelection{
+		URL:           rewriteTemplateURL(tpl.Template, item.GoodsID, item.SKUID),
+		TemplateID:    tpl.ID,
+		TemplateIndex: nextIndex + 1,
+		TemplateTotal: len(activeTemplates),
+	}
+}
+
+func (s *Service) advanceDeviceURLTemplateAfterRisk(deviceID string, cfg rt.SystemConfig, templateID string) (bool, bool) {
+	activeTemplates := s.activeURLTemplatesForDevice(deviceID, cfg)
+	if len(activeTemplates) == 0 || templateID == "" {
+		return false, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := s.urlTemplateState[deviceID]
+	if state.RiskedIDs == nil {
+		state.RiskedIDs = map[string]struct{}{}
+	}
+	state.RiskedIDs[templateID] = struct{}{}
+	nextIndex := -1
+	for index := state.CurrentIndex + 1; index < len(activeTemplates); index++ {
+		if _, risked := state.RiskedIDs[activeTemplates[index].ID]; risked {
+			continue
+		}
+		nextIndex = index
+		break
+	}
+	if nextIndex >= 0 {
+		state.CurrentIndex = nextIndex
+		s.urlTemplateState[deviceID] = state
+		return true, false
+	}
+	state.CurrentIndex = len(activeTemplates)
+	s.urlTemplateState[deviceID] = state
+	return true, true
+}
+
+func (s *Service) activeURLTemplatesForDevice(deviceID string, cfg rt.SystemConfig) []rt.URLTemplateRecord {
+	activeTemplates := activeURLTemplates(cfg)
+	if s.devices == nil {
+		return activeTemplates
+	}
+	selectedIDs := s.devices.SelectedURLTemplateIDs(deviceID)
+	if len(activeTemplates) == 0 || len(selectedIDs) == 0 {
+		return activeTemplates
+	}
+	selectedSet := make(map[string]struct{}, len(selectedIDs))
+	for _, id := range selectedIDs {
+		if strings.TrimSpace(id) == "" {
+			continue
+		}
+		selectedSet[id] = struct{}{}
+	}
+	if len(selectedSet) == 0 {
+		return activeTemplates
+	}
+	filtered := make([]rt.URLTemplateRecord, 0, len(activeTemplates))
+	for _, tpl := range activeTemplates {
+		if _, ok := selectedSet[tpl.ID]; ok {
+			filtered = append(filtered, tpl)
+		}
+	}
+	return filtered
+}
+
+func activeURLTemplates(cfg rt.SystemConfig) []rt.URLTemplateRecord {
+	if !cfg.UseURLTemplates {
+		return nil
+	}
+	result := make([]rt.URLTemplateRecord, 0, len(cfg.URLTemplates))
+	for _, tpl := range cfg.URLTemplates {
+		if strings.TrimSpace(tpl.Template) == "" {
+			continue
+		}
+		result = append(result, tpl)
+	}
+	return result
+}
+
+func resolveDeviceURLTemplateIndex(state deviceURLTemplateState, activeTemplates []rt.URLTemplateRecord) int {
+	if len(activeTemplates) == 0 {
+		return -1
+	}
+	start := state.CurrentIndex
+	if start < 0 {
+		start = 0
+	}
+	if start >= len(activeTemplates) {
+		return -1
+	}
+	for index := start; index < len(activeTemplates); index++ {
+		if _, risked := state.RiskedIDs[activeTemplates[index].ID]; risked {
+			continue
+		}
+		return index
+	}
+	return -1
 }
 
 func buildUpstreamOptions(items []upstream.Record) []map[string]any {
@@ -1279,15 +1737,24 @@ func buildUpstreamOptions(items []upstream.Record) []map[string]any {
 }
 
 func buildTaskURL(cfg rt.SystemConfig, item clientTaskItem) string {
+	return selectTaskURL(cfg, item).URL
+}
+
+func selectTaskURL(cfg rt.SystemConfig, item clientTaskItem) taskURLSelection {
 	if cfg.UseURLTemplates {
 		for _, tpl := range cfg.URLTemplates {
 			if strings.TrimSpace(tpl.Template) == "" {
 				continue
 			}
-			return rewriteTemplateURL(tpl.Template, item.GoodsID, item.SKUID)
+			return taskURLSelection{
+				URL:        rewriteTemplateURL(tpl.Template, item.GoodsID, item.SKUID),
+				TemplateID: tpl.ID,
+			}
 		}
 	}
-	return fmt.Sprintf("https://mobile.yangkeduo.com/order_checkout.html?goods_id=%s&sku_id=%s", item.GoodsID, item.SKUID)
+	return taskURLSelection{
+		URL: fmt.Sprintf("https://mobile.yangkeduo.com/order_checkout.html?goods_id=%s&sku_id=%s", item.GoodsID, item.SKUID),
+	}
 }
 
 var (
@@ -1394,23 +1861,25 @@ func eventToMap(record rt.EventRecord) map[string]any {
 
 func detailToMap(record rt.DetailRecord) map[string]any {
 	return map[string]any{
-		"id":                record.ID,
-		"timestamp":         record.Timestamp,
-		"task_id":           record.TaskID,
-		"upstream_task_ref": record.UpstreamTaskRef,
-		"task_mode":         record.TaskMode,
-		"device_id":         record.DeviceID,
-		"goods_id":          record.GoodsID,
-		"sku_id":            record.SKUID,
-		"url":               record.URL,
-		"status":            record.Status,
-		"recognition":       record.Recognition,
-		"image_count":       record.ImageCount,
-		"capture_url":       record.CaptureURL,
-		"capture_urls":      record.CaptureURLs,
-		"message":           record.Message,
-		"template_id":       record.TemplateID,
-		"template_label":    record.TemplateLabel,
+		"id":                 record.ID,
+		"timestamp":          record.Timestamp,
+		"task_id":            record.TaskID,
+		"upstream_task_ref":  record.UpstreamTaskRef,
+		"task_mode":          record.TaskMode,
+		"device_id":          record.DeviceID,
+		"goods_id":           record.GoodsID,
+		"sku_id":             record.SKUID,
+		"url":                record.URL,
+		"status":             record.Status,
+		"recognition":        record.Recognition,
+		"image_count":        record.ImageCount,
+		"capture_url":        record.CaptureURL,
+		"capture_urls":       record.CaptureURLs,
+		"message":            record.Message,
+		"template_id":        record.TemplateID,
+		"template_label":     record.TemplateLabel,
+		"recognition_engine": record.RecognitionEngine,
+		"adb_command":        record.ADBCommand,
 	}
 }
 

@@ -83,6 +83,8 @@ pub struct ClientTask {
     pub account_name: Option<String>,
     #[serde(default)]
     pub task_items: Vec<ClientTaskItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_upstream: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -12,21 +12,30 @@ type Config struct {
 	HTTPAddr         string
 	FrontendDistDir  string
 	AdapterBaseURL   string
+	OpenCVBaseURL    string
+	OCRBaseURL       string
 	OCRModelDir      string
 	OpenCVAssetDir   string
+	RuntimeDir       string
+	DebugAssetDir    string
 	ADBPath          string
 	SQLitePath       string
 	EnableVisionMock bool
 }
 
 func Load() Config {
-	sqlitePath := getenv("SQLITE_PATH", "./.runtime/unified-server.db")
+	runtimeDir := resolveRuntimeDir(strings.TrimSpace(os.Getenv("RUNTIME_DIR")))
+	sqlitePath := getenv("SQLITE_PATH", filepath.Join(runtimeDir, "unified-server.db"))
 	return Config{
 		HTTPAddr:         getenv("UNIFIED_HTTP_ADDR", ":18080"),
 		FrontendDistDir:  getenv("FRONTEND_DIST_DIR", "./frontend/dist"),
 		AdapterBaseURL:   getenv("ADAPTER_BASE_URL", "http://127.0.0.1:8091"),
+		OpenCVBaseURL:    getenv("OPENCV_BASE_URL", "http://127.0.0.1:7771"),
+		OCRBaseURL:       getenv("OCR_BASE_URL", "http://127.0.0.1:5005"),
 		OCRModelDir:      getenv("OCR_MODEL_DIR", "./assets/ocr"),
 		OpenCVAssetDir:   getenv("OPENCV_ASSET_DIR", "./assets/opencv"),
+		RuntimeDir:       runtimeDir,
+		DebugAssetDir:    filepath.Join(runtimeDir, "debug"),
 		ADBPath:          resolveADBPath(),
 		SQLitePath:       resolveProjectPath(sqlitePath),
 		EnableVisionMock: getenv("ENABLE_VISION_MOCK", "false") == "true",
@@ -43,6 +52,10 @@ func getenv(key string, fallback string) string {
 func resolveADBPath() string {
 	if value := strings.TrimSpace(os.Getenv("ADB_PATH")); value != "" {
 		return normalizeADBPath(value)
+	}
+
+	if resolved, ok := findBundledADBPath(); ok {
+		return resolved
 	}
 
 	for _, root := range []string{
@@ -65,6 +78,44 @@ func resolveADBPath() string {
 		return resolved
 	}
 	return adbExecutableName()
+}
+
+func findBundledADBPath() (string, bool) {
+	projectRoot, _ := findProjectRoot()
+	executableDir := ""
+	if executablePath, err := os.Executable(); err == nil {
+		executableDir = filepath.Dir(executablePath)
+	}
+	return findBundledADBPathIn(projectRoot, executableDir)
+}
+
+func findBundledADBPathIn(projectRoot string, executableDir string) (string, bool) {
+	candidates := make([]string, 0, 6)
+	addCandidate := func(candidate string) {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			return
+		}
+		candidates = append(candidates, filepath.Clean(candidate))
+	}
+
+	if projectRoot != "" {
+		addCandidate(filepath.Join(projectRoot, "adb", adbExecutableName()))
+		addCandidate(filepath.Join(projectRoot, adbExecutableName()))
+		addCandidate(filepath.Join(projectRoot, "platform-tools", adbExecutableName()))
+	}
+	if executableDir != "" {
+		addCandidate(filepath.Join(executableDir, "adb", adbExecutableName()))
+		addCandidate(filepath.Join(executableDir, adbExecutableName()))
+		addCandidate(filepath.Join(executableDir, "platform-tools", adbExecutableName()))
+	}
+
+	for _, candidate := range candidates {
+		if fileExists(candidate) {
+			return candidate, true
+		}
+	}
+	return "", false
 }
 
 func normalizeADBPath(value string) string {
@@ -97,6 +148,32 @@ func resolveProjectPath(value string) string {
 		return abs
 	}
 	return value
+}
+
+func resolveRuntimeDir(value string) string {
+	value = strings.TrimSpace(value)
+	if value != "" {
+		return resolveProjectPath(value)
+	}
+	return filepath.Join(defaultAppDataDir(), "unified-server")
+}
+
+func defaultAppDataDir() string {
+	for _, item := range []string{
+		strings.TrimSpace(os.Getenv("LOCALAPPDATA")),
+		strings.TrimSpace(os.Getenv("APPDATA")),
+	} {
+		if item != "" {
+			return filepath.Join(item, "PddGoRust")
+		}
+	}
+	if dir, err := os.UserConfigDir(); err == nil && strings.TrimSpace(dir) != "" {
+		return filepath.Join(dir, "PddGoRust")
+	}
+	if dir, err := os.UserHomeDir(); err == nil && strings.TrimSpace(dir) != "" {
+		return filepath.Join(dir, ".pdd-go-rust")
+	}
+	return filepath.Clean(".runtime")
 }
 
 func findProjectRoot() (string, bool) {

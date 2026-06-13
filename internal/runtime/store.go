@@ -17,6 +17,7 @@ const (
 
 type URLTemplateRecord struct {
 	ID           string `json:"id"`
+	Name         string `json:"name,omitempty"`
 	Template     string `json:"template"`
 	TriggerCount int    `json:"trigger_count"`
 	SuccessCount int    `json:"success_count"`
@@ -41,39 +42,48 @@ type EventRecord struct {
 }
 
 type DetailRecord struct {
-	ID              string   `json:"id"`
-	Timestamp       string   `json:"timestamp"`
-	TaskID          string   `json:"task_id"`
-	UpstreamTaskRef string   `json:"upstream_task_ref,omitempty"`
-	TaskMode        string   `json:"task_mode"`
-	DeviceID        string   `json:"device_id"`
-	GoodsID         string   `json:"goods_id,omitempty"`
-	SKUID           string   `json:"sku_id,omitempty"`
-	URL             string   `json:"url,omitempty"`
-	Status          string   `json:"status"`
-	Recognition     string   `json:"recognition"`
-	ImageCount      int      `json:"image_count"`
-	CaptureURL      string   `json:"capture_url,omitempty"`
-	CaptureURLs     []string `json:"capture_urls,omitempty"`
-	Message         string   `json:"message,omitempty"`
-	TemplateID      string   `json:"template_id,omitempty"`
-	TemplateLabel   string   `json:"template_label,omitempty"`
+	ID                string   `json:"id"`
+	Timestamp         string   `json:"timestamp"`
+	TaskID            string   `json:"task_id"`
+	UpstreamTaskRef   string   `json:"upstream_task_ref,omitempty"`
+	TaskMode          string   `json:"task_mode"`
+	DeviceID          string   `json:"device_id"`
+	GoodsID           string   `json:"goods_id,omitempty"`
+	SKUID             string   `json:"sku_id,omitempty"`
+	URL               string   `json:"url,omitempty"`
+	Status            string   `json:"status"`
+	Recognition       string   `json:"recognition"`
+	ImageCount        int      `json:"image_count"`
+	CaptureURL        string   `json:"capture_url,omitempty"`
+	CaptureURLs       []string `json:"capture_urls,omitempty"`
+	Message           string   `json:"message,omitempty"`
+	TemplateID        string   `json:"template_id,omitempty"`
+	TemplateLabel     string   `json:"template_label,omitempty"`
+	RecognitionEngine string   `json:"recognition_engine,omitempty"`
+	ADBCommand        string   `json:"adb_command,omitempty"`
 }
 
 type PendingTaskRecord struct {
-	TaskID          string `json:"task_id"`
-	UpstreamTaskRef string `json:"upstream_task_ref,omitempty"`
-	SourceCode      string `json:"source_code,omitempty"`
-	SourceName      string `json:"source_name,omitempty"`
-	AccountID       string `json:"account_id,omitempty"`
-	AccountName     string `json:"account_name,omitempty"`
-	ItemCount       int    `json:"item_count"`
-	TotalItemCount  int    `json:"total_item_count,omitempty"`
-	PendingCount    int    `json:"pending_count,omitempty"`
-	ActiveCount     int    `json:"active_count,omitempty"`
-	CompletedCount  int    `json:"completed_count,omitempty"`
-	Status          string `json:"status,omitempty"`
-	PrefetchedAt    string `json:"prefetched_at,omitempty"`
+	TaskID          string                  `json:"task_id"`
+	UpstreamTaskRef string                  `json:"upstream_task_ref,omitempty"`
+	SourceCode      string                  `json:"source_code,omitempty"`
+	SourceName      string                  `json:"source_name,omitempty"`
+	AccountID       string                  `json:"account_id,omitempty"`
+	AccountName     string                  `json:"account_name,omitempty"`
+	TaskItems       []PendingTaskItemRecord `json:"task_items,omitempty"`
+	ItemCount       int                     `json:"item_count"`
+	TotalItemCount  int                     `json:"total_item_count,omitempty"`
+	PendingCount    int                     `json:"pending_count,omitempty"`
+	ActiveCount     int                     `json:"active_count,omitempty"`
+	CompletedCount  int                     `json:"completed_count,omitempty"`
+	Status          string                  `json:"status,omitempty"`
+	PrefetchedAt    string                  `json:"prefetched_at,omitempty"`
+}
+
+type PendingTaskItemRecord struct {
+	GoodsID   string `json:"goods_id,omitempty"`
+	SKUID     string `json:"sku_id,omitempty"`
+	StepIndex int    `json:"step_index,omitempty"`
 }
 
 type AdapterSubmitLogRecord struct {
@@ -171,6 +181,40 @@ func (s *Store) UpdateSystemConfig(next SystemConfig) SystemConfig {
 	s.systemConfig = next
 	s.persistSystemConfigLocked()
 	return s.systemConfig
+}
+
+func (s *Store) RecordURLTemplateTrigger(templateID string) {
+	s.recordURLTemplate(templateID, func(item *URLTemplateRecord) {
+		item.TriggerCount++
+	})
+}
+
+func (s *Store) RecordURLTemplateSuccess(templateID string) {
+	s.recordURLTemplate(templateID, func(item *URLTemplateRecord) {
+		item.SuccessCount++
+	})
+}
+
+func (s *Store) RecordURLTemplateRisk(templateID string) {
+	s.recordURLTemplate(templateID, func(item *URLTemplateRecord) {
+		item.RiskCount++
+	})
+}
+
+func (s *Store) recordURLTemplate(templateID string, mutate func(item *URLTemplateRecord)) {
+	if templateID == "" || mutate == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for index := range s.systemConfig.URLTemplates {
+		if s.systemConfig.URLTemplates[index].ID != templateID {
+			continue
+		}
+		mutate(&s.systemConfig.URLTemplates[index])
+		s.persistLocked()
+		return
+	}
 }
 
 func (s *Store) AddEvent(record EventRecord) EventRecord {
@@ -294,6 +338,12 @@ func cloneDetails(items []DetailRecord) []DetailRecord {
 func clonePending(items []PendingTaskRecord) []PendingTaskRecord {
 	result := make([]PendingTaskRecord, len(items))
 	copy(result, items)
+	for i := range result {
+		if len(items[i].TaskItems) > 0 {
+			result[i].TaskItems = make([]PendingTaskItemRecord, len(items[i].TaskItems))
+			copy(result[i].TaskItems, items[i].TaskItems)
+		}
+	}
 	return result
 }
 

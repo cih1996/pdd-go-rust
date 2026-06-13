@@ -71,6 +71,8 @@ func (d RouterDeps) runSingleDebug(r *http.Request, payload debugRunRequest) (ma
 	captureURLs := make([]string, 0, 5)
 	shouldStop := false
 	matched := false
+	clickTriggered := false
+	matchedOnceTemplates := make(map[string]struct{})
 	finalRecognition := "no_match"
 	finalMessage := "5 轮内未命中任何终态模板"
 	finalStatus := "failure"
@@ -99,7 +101,7 @@ func (d RouterDeps) runSingleDebug(r *http.Request, payload debugRunRequest) (ma
 			ElapsedMS: elapsedMillis(captureStart),
 		})
 
-		captureURL, err := saveDebugCapture(captureBytes)
+		captureURL, err := saveDebugCapture(d.Config.DebugAssetDir, captureBytes)
 		if err != nil {
 			return nil, fmt.Errorf("保存截图失败: %w", err)
 		}
@@ -109,7 +111,7 @@ func (d RouterDeps) runSingleDebug(r *http.Request, payload debugRunRequest) (ma
 		stageMatched := false
 		for _, stage := range []string{"account_risk", "fail_release", "click_image", "success_image"} {
 			stageName := stageDisplayName(stage)
-			templates := d.Tpl.ListEnabledByType(stage)
+			templates := filterDebugTemplates(d.Tpl.ListEnabledByType(stage), stage, clickTriggered, matchedOnceTemplates)
 			for _, item := range templates {
 				requestStart := time.Now()
 				match, nextCache, err := d.Vision.Match(item, captureBytes, cache)
@@ -123,6 +125,7 @@ func (d RouterDeps) runSingleDebug(r *http.Request, payload debugRunRequest) (ma
 				if !match.Found {
 					continue
 				}
+				rememberDebugMatchedTemplate(matchedOnceTemplates, item)
 
 				stageMatched = true
 				matched = true
@@ -138,6 +141,7 @@ func (d RouterDeps) runSingleDebug(r *http.Request, payload debugRunRequest) (ma
 				case "fail_release":
 					finalStatus = "failure"
 				case "click_image":
+					clickTriggered = true
 					if err := d.Devices.Tap(ctx, payload.DeviceID, match.Center[0], match.Center[1]); err != nil {
 						return nil, fmt.Errorf("点击失败: %w", err)
 					}
@@ -369,4 +373,27 @@ func validateDebugTemplates(store *template.Store) error {
 		}
 	}
 	return nil
+}
+
+func filterDebugTemplates(items []template.Record, stage string, clickTriggered bool, matchedOnceTemplates map[string]struct{}) []template.Record {
+	filtered := make([]template.Record, 0, len(items))
+	for _, item := range items {
+		if item.MatchOncePerTask {
+			if _, exists := matchedOnceTemplates[item.ID]; exists {
+				continue
+			}
+		}
+		if stage == "fail_release" && item.RequiresClick && !clickTriggered {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	return filtered
+}
+
+func rememberDebugMatchedTemplate(matchedOnceTemplates map[string]struct{}, item template.Record) {
+	if !item.MatchOncePerTask || matchedOnceTemplates == nil {
+		return
+	}
+	matchedOnceTemplates[item.ID] = struct{}{}
 }

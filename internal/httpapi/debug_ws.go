@@ -117,6 +117,8 @@ func (h *debugCommandHandler) runDebug(ctx context.Context, clientID string, pay
 	finalMessage := "5 轮内未命中任何终态模板"
 	finalTemplateID := ""
 	finalTemplateLabel := ""
+	clickTriggered := false
+	matchedOnceTemplates := make(map[string]struct{})
 	matched := false
 	shouldStop := false
 
@@ -162,7 +164,7 @@ func (h *debugCommandHandler) runDebug(ctx context.Context, clientID string, pay
 		captureElapsed := elapsedMillis(captureStart)
 		captureSteps = append(captureSteps, debugCaptureStep{LoopCount: loop, ElapsedMS: captureElapsed})
 
-		captureURL, err := saveDebugCapture(captureBytes)
+		captureURL, err := saveDebugCapture(h.config.DebugAssetDir, captureBytes)
 		if err != nil {
 			h.sendError(clientID, payload.RequestID, "保存截图失败: "+err.Error())
 			return
@@ -178,7 +180,7 @@ func (h *debugCommandHandler) runDebug(ctx context.Context, clientID string, pay
 		cache := (*vision.OCRCache)(nil)
 		for _, stage := range []string{"account_risk", "fail_release", "click_image", "success_image"} {
 			stageName := stageDisplayName(stage)
-			templates := h.tpl.ListEnabledByType(stage)
+			templates := filterDebugTemplates(h.tpl.ListEnabledByType(stage), stage, clickTriggered, matchedOnceTemplates)
 			h.send(clientID, "debug_run_stage_started", map[string]any{
 				"request_id":     payload.RequestID,
 				"loop_count":     loop,
@@ -228,6 +230,7 @@ func (h *debugCommandHandler) runDebug(ctx context.Context, clientID string, pay
 				if !match.Found {
 					continue
 				}
+				rememberDebugMatchedTemplate(matchedOnceTemplates, item)
 				matched = true
 				finalRecognition = stage
 				finalTemplateID = item.ID
@@ -245,6 +248,7 @@ func (h *debugCommandHandler) runDebug(ctx context.Context, clientID string, pay
 					h.finish(clientID, payload, taskID, matched, shouldStop, finalStatus, finalRecognition, finalMessage, finalTemplateID, finalTemplateLabel, captureURLs, debugResults, captureSteps, openURLElapsedMS, totalStart)
 					return
 				case "click_image":
+					clickTriggered = true
 					clickStart := time.Now()
 					if err := h.devices.Tap(ctx, payload.DeviceID, match.Center[0], match.Center[1]); err != nil {
 						h.sendError(clientID, payload.RequestID, "点击失败: "+err.Error())

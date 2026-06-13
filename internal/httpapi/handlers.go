@@ -68,6 +68,16 @@ func (d RouterDeps) handleState(w http.ResponseWriter, r *http.Request) {
 	if adapterErr != nil {
 		adapterMessage = adapterErr.Error()
 	}
+	opencvMessage := "opencv state ready"
+	opencvErr := d.checkServiceHealth(ctx, strings.TrimRight(d.Config.OpenCVBaseURL, "/")+"/health")
+	if opencvErr != nil {
+		opencvMessage = opencvErr.Error()
+	}
+	ocrMessage := "ocr state ready"
+	ocrErr := d.checkServiceHealth(ctx, strings.TrimRight(d.Config.OCRBaseURL, "/")+"/health")
+	if ocrErr != nil {
+		ocrMessage = ocrErr.Error()
+	}
 	serviceLinks := []any{
 		map[string]any{
 			"key":     "unified",
@@ -82,6 +92,20 @@ func (d RouterDeps) handleState(w http.ResponseWriter, r *http.Request) {
 			"url":     d.Config.AdapterBaseURL,
 			"healthy": adapterErr == nil,
 			"message": adapterMessage,
+		},
+		map[string]any{
+			"key":     "opencv",
+			"name":    "OpenCV服务",
+			"url":     d.Config.OpenCVBaseURL,
+			"healthy": opencvErr == nil,
+			"message": opencvMessage,
+		},
+		map[string]any{
+			"key":     "ocr",
+			"name":    "OCR服务",
+			"url":     d.Config.OCRBaseURL,
+			"healthy": ocrErr == nil,
+			"message": ocrMessage,
 		},
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -119,6 +143,22 @@ func (d RouterDeps) fetchAdapterState(ctx context.Context) (map[string]any, erro
 		return nil, err
 	}
 	return payload, nil
+}
+
+func (d RouterDeps) checkServiceHealth(ctx context.Context, rawURL string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= http.StatusBadRequest {
+		return fmt.Errorf("service status %d", resp.StatusCode)
+	}
+	return nil
 }
 
 func (d RouterDeps) handleTemplates(w http.ResponseWriter, r *http.Request) {
@@ -314,6 +354,44 @@ func (d RouterDeps) handleConnectDevice(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"message": "device connected", "device": item})
+}
+
+func (d RouterDeps) handleDeviceURLTemplates(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+		return
+	}
+	deviceID := strings.TrimSpace(r.PathValue("deviceId"))
+	if deviceID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing device id"})
+		return
+	}
+	var payload struct {
+		TemplateIDs []string `json:"template_ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid device url template payload"})
+		return
+	}
+	normalized := make([]string, 0, len(payload.TemplateIDs))
+	seen := map[string]struct{}{}
+	for _, item := range payload.TemplateIDs {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if _, exists := seen[item]; exists {
+			continue
+		}
+		seen[item] = struct{}{}
+		normalized = append(normalized, item)
+	}
+	deviceItem := d.Devices.UpdateURLTemplateSelection(deviceID, normalized)
+	d.Tasks.ResetDeviceURLTemplateState(deviceID)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"message": "device url templates updated",
+		"device":  deviceItem,
+	})
 }
 
 func (d RouterDeps) handleSystemConfig(w http.ResponseWriter, r *http.Request) {
