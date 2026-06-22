@@ -31,3 +31,4 @@ This directory contains the initial scaffold only. Go and Rust toolchains are re
 - `docs/ai-handoff.md`: current status, legacy protocol notes, migration plan, pending work
 - `docs/adapter-apipost.md`: adapter and unified-server Apipost examples
 - `docs/architecture.md`: architecture draft
+- `docs/business-logic-template-library.md`: 当前主要业务逻辑、模板机制，以及后续设备级模板库改造建议

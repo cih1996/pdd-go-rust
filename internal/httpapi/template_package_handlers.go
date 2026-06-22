@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -60,53 +61,8 @@ func (d RouterDeps) handleExportTemplates(w http.ResponseWriter, r *http.Request
 	}
 
 	records := d.Tpl.List()
-	buffer := &bytes.Buffer{}
-	zipWriter := zip.NewWriter(buffer)
-
-	sanitized := make([]template.Record, 0, len(records))
-	for _, item := range records {
-		exportItem := item
-		if exportItem.ImageName != "" {
-			exportItem.ImageURL = "/assets/templates/" + exportItem.ImageName
-		}
-		exportItem.ImagePath = ""
-		sanitized = append(sanitized, exportItem)
-	}
-
-	if err := writeZipJSON(zipWriter, "templates.json", sanitized); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if err := writeZipJSON(zipWriter, "meta.json", map[string]any{
-		"exported_at":    time.Now().UTC().Format(time.RFC3339Nano),
-		"template_count": len(sanitized),
-	}); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	for _, item := range records {
-		if strings.TrimSpace(item.ImageName) == "" {
-			continue
-		}
-		imagePath := item.ImagePath
-		if imagePath == "" {
-			imagePath = filepath.Join(d.Tpl.ImageDir(), item.ImageName)
-		}
-		data, err := os.ReadFile(imagePath)
-		if err != nil {
-			continue
-		}
-		entry, err := zipWriter.Create("images/" + item.ImageName)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		if _, err := entry.Write(data); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-	}
-	if err := zipWriter.Close(); err != nil {
+	packageBytes, err := buildTemplatePackage(records, d.Tpl.ImageDir())
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -115,7 +71,7 @@ func (d RouterDeps) handleExportTemplates(w http.ResponseWriter, r *http.Request
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", fileName))
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(buffer.Bytes())
+	_, _ = w.Write(packageBytes)
 }
 
 func importTemplatePackage(raw []byte, imageDir string) ([]template.Record, error) {
@@ -147,15 +103,13 @@ func importTemplatePackage(raw []byte, imageDir string) ([]template.Record, erro
 		return nil, err
 	}
 	for i := range records {
-		if strings.TrimSpace(records[i].ImageName) == "" {
+		records[i].ImageName = normalizeTemplateImageName(records[i].ImageName)
+		if records[i].ImageName == "" {
 			records[i].ImageURL = ""
 			records[i].ImagePath = ""
 			continue
 		}
-		imageFile := files["images/"+records[i].ImageName]
-		if imageFile == nil {
-			imageFile = files[records[i].ImageName]
-		}
+		imageFile := findImportedImageFile(files, records[i].ImageName)
 		if imageFile == nil {
 			return nil, fmt.Errorf("missing image file: %s", records[i].ImageName)
 		}
@@ -172,6 +126,102 @@ func importTemplatePackage(raw []byte, imageDir string) ([]template.Record, erro
 	}
 
 	return records, nil
+}
+
+func buildTemplatePackage(records []template.Record, imageDir string) ([]byte, error) {
+	buffer := &bytes.Buffer{}
+	zipWriter := zip.NewWriter(buffer)
+
+	sanitized := make([]template.Record, 0, len(records))
+	for _, item := range records {
+		exportItem := item
+		exportItem.ImageName = normalizeTemplateImageName(exportItem.ImageName)
+		if exportItem.ImageName != "" {
+			exportItem.ImageURL = "/api/assets/templates/" + exportItem.ImageName
+		}
+		exportItem.ImagePath = ""
+		sanitized = append(sanitized, exportItem)
+	}
+
+	if err := writeZipJSON(zipWriter, "templates.json", sanitized); err != nil {
+		return nil, err
+	}
+	if err := writeZipJSON(zipWriter, "meta.json", map[string]any{
+		"exported_at":    time.Now().UTC().Format(time.RFC3339Nano),
+		"template_count": len(sanitized),
+	}); err != nil {
+		return nil, err
+	}
+	for _, item := range sanitized {
+		if item.ImageName == "" {
+			continue
+		}
+		data, err := readTemplateImageForExport(item, imageDir)
+		if err != nil {
+			return nil, fmt.Errorf("export template image failed for %s: %w", item.Label, err)
+		}
+		entry, err := zipWriter.Create("images/" + item.ImageName)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := entry.Write(data); err != nil {
+			return nil, err
+		}
+	}
+	if err := zipWriter.Close(); err != nil {
+		return nil, err
+	}
+	return buffer.Bytes(), nil
+}
+
+func readTemplateImageForExport(item template.Record, imageDir string) ([]byte, error) {
+	candidates := make([]string, 0, 2)
+	if current := strings.TrimSpace(item.ImagePath); current != "" {
+		candidates = append(candidates, current)
+	}
+	if item.ImageName != "" {
+		fallback := filepath.Join(imageDir, item.ImageName)
+		if len(candidates) == 0 || !sameFilePath(candidates[0], fallback) {
+			candidates = append(candidates, fallback)
+		}
+	}
+	for _, candidate := range candidates {
+		data, err := os.ReadFile(candidate)
+		if err == nil {
+			return data, nil
+		}
+	}
+	return nil, fmt.Errorf("missing image file: %s", item.ImageName)
+}
+
+func findImportedImageFile(files map[string]*zip.File, imageName string) *zip.File {
+	candidates := []string{
+		"images/" + imageName,
+		imageName,
+		"images/" + path.Base(strings.ReplaceAll(imageName, "\\", "/")),
+		path.Base(strings.ReplaceAll(imageName, "\\", "/")),
+	}
+	for _, candidate := range candidates {
+		if file := files[candidate]; file != nil {
+			return file
+		}
+	}
+	return nil
+}
+
+func normalizeTemplateImageName(name string) string {
+	name = strings.TrimSpace(strings.ReplaceAll(name, "\\", "/"))
+	if name == "" {
+		return ""
+	}
+	return path.Base(name)
+}
+
+func sameFilePath(left string, right string) bool {
+	if strings.TrimSpace(left) == "" || strings.TrimSpace(right) == "" {
+		return false
+	}
+	return filepath.Clean(left) == filepath.Clean(right)
 }
 
 func readZipFile(file *zip.File) ([]byte, error) {
