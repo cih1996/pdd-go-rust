@@ -8,6 +8,7 @@ const props = defineProps<{
   upstreamOptions: UpstreamOption[]
   importing: boolean
   savingAccountId: string
+  testingAccountId?: string
   batchProcessing?: boolean
 }>()
 
@@ -15,6 +16,7 @@ const emit = defineEmits<{
   (event: 'import', payload: { upstream_code: string; lines: string }): void
   (event: 'toggle', payload: { accountId: string; enabled: boolean }): void
   (event: 'delete', accountId: string): void
+  (event: 'test', accountId: string): void
   (event: 'batch-toggle', payload: { accountIds: string[]; enabled: boolean }): void
   (event: 'batch-delete', accountIds: string[]): void
 }>()
@@ -263,8 +265,16 @@ async function confirmDelete(accountId: string) {
                 </el-tag>
               </template>
             </el-table-column>
-            <el-table-column label="操作" width="140" fixed="right" align="center">
+            <el-table-column label="操作" width="200" fixed="right" align="center">
               <template #default="{ row }">
+                <el-button
+                  link
+                  type="success"
+                  :loading="props.testingAccountId === row.id"
+                  @click="emit('test', row.id)"
+                >
+                  测试
+                </el-button>
                 <el-button
                   link
                   type="primary"

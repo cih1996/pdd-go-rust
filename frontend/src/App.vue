@@ -23,6 +23,7 @@ import {
   startTasks,
   stopTasks,
   testTemplate,
+  testPlatformAccountFetch,
   testUnsavedTemplate,
   togglePlatformAccount,
   toggleUpstreamConfig,
@@ -77,6 +78,7 @@ const savingSystemConfig = ref(false)
 const savingUpstreamId = ref('')
 const importingAccounts = ref(false)
 const savingAccountId = ref('')
+const testingAccountId = ref('')
 const batchProcessingAccounts = ref(false)
 const launchingServiceKey = ref('')
 const desktopUpdateLoading = ref(false)
@@ -632,6 +634,7 @@ async function handleCreateUpstreamConfig(payload: {
   enabled?: boolean
   priority?: number
   base_url: string
+  proxy_url?: string | null
   notes?: string | null
 }) {
   savingUpstreamId.value = '__creating__'
@@ -655,6 +658,7 @@ async function handleUpdateUpstreamConfig(payload: {
     enabled?: boolean
     priority?: number
     base_url: string
+    proxy_url?: string | null
     notes?: string | null
   }
 }) {
@@ -751,6 +755,20 @@ async function handleDeletePlatformAccount(accountId: string) {
     ElMessage.error(errorMessage.value)
   } finally {
     savingAccountId.value = ''
+  }
+}
+
+async function handleTestPlatformAccount(accountId: string) {
+  testingAccountId.value = accountId
+  try {
+    const result = await testPlatformAccountFetch(accountId)
+    ElMessage.success(result.message)
+    await loadState()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '测试领取失败'
+    ElMessage.error(errorMessage.value)
+  } finally {
+    testingAccountId.value = ''
   }
 }
 
@@ -1102,8 +1120,10 @@ onUnmounted(() => {
           :upstream-options="state.upstream_options"
           :importing="importingAccounts"
           :saving-account-id="savingAccountId"
+          :testing-account-id="testingAccountId"
           :batch-processing="batchProcessingAccounts"
           @import="handleImportPlatformAccounts"
+          @test="handleTestPlatformAccount"
           @toggle="handleTogglePlatformAccount"
           @delete="handleDeletePlatformAccount"
           @batch-toggle="handleBatchTogglePlatformAccounts"

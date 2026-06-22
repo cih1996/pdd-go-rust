@@ -61,6 +61,7 @@ func NewRouter(cfg config.Config, hub *ws.Hub, tasks *task.Service, tpl *templat
 	mux.HandleFunc("/api/devices/connect", deps.handleConnectDevice)
 	mux.HandleFunc("/api/system-config", deps.handleSystemConfig)
 	mux.HandleFunc("/api/platform-accounts/import", deps.handleImportPlatformAccounts)
+	mux.HandleFunc("/api/platform-accounts/{accountId}/test-fetch", deps.handleTestPlatformAccountFetch)
 	mux.HandleFunc("/api/platform-accounts/{accountId}/toggle", deps.handleTogglePlatformAccount)
 	mux.HandleFunc("/api/platform-accounts/{accountId}", deps.handleDeletePlatformAccount)
 	mux.HandleFunc("/api/mock-data/import", deps.handleImportMockData)

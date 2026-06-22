@@ -53,12 +53,45 @@ function openTaskUrl(url?: string | null) {
   window.open(target, '_blank', 'noopener')
 }
 
+function submitStatusTagType(status?: number | null) {
+  if (!status) return 'info'
+  if (status >= 500) return 'danger'
+  if (status >= 400) return 'warning'
+  return 'success'
+}
+
+function formatSubmitStatus(status?: number | null): string {
+  if (!status) return '--'
+  return `HTTP ${status}`
+}
+
+function formatSubmitError(detail: DetailRecord): string {
+  const parts: string[] = []
+  if (detail.submit_status_code) {
+    parts.push(`状态码: HTTP ${detail.submit_status_code}`)
+  }
+  if (detail.submit_error?.trim()) {
+    parts.push(`原始错误: ${detail.submit_error.trim()}`)
+  }
+  return parts.join('\n')
+}
+
 const filteredDetails = computed(() => {
   const keyword = searchKeyword.value.trim()
   return props.details.filter((d) => {
     const matchDevice = searchDevice.value ? d.device_id.includes(searchDevice.value) : true
     const matchTask = keyword
-      ? [d.upstream_task_ref, d.url, d.recognition, d.task_id, d.goods_id, d.sku_id].some((item) => item?.includes(keyword))
+      ? [
+          d.upstream_task_ref,
+          d.url,
+          d.recognition,
+          d.task_id,
+          d.goods_id,
+          d.sku_id,
+          d.message,
+          d.submit_error,
+          d.submit_status_code ? String(d.submit_status_code) : '',
+        ].some((item) => item?.includes(keyword))
       : true
     return matchDevice && matchTask
   })
@@ -204,7 +237,7 @@ const filteredDetails = computed(() => {
           </template>
         </el-table-column>
         
-        <el-table-column label="详情信息" min-width="240">
+        <el-table-column label="详情信息" min-width="320">
           <template #default="{ row }">
             <div class="detail-info-cell">
               <div v-if="row.recognition" class="recognition-text" title="识别内容">
@@ -213,7 +246,35 @@ const filteredDetails = computed(() => {
               <div class="message-text" :class="{'is-error': row.status === 'failure'}" :title="row.message">
                 {{ row.message || '-' }}
               </div>
+              <div
+                v-if="row.submit_status_code || row.submit_error"
+                class="submit-error-box"
+                :title="formatSubmitError(row)"
+              >
+                <div class="submit-error-title">提交错误</div>
+                <div class="submit-error-body">{{ formatSubmitError(row) }}</div>
+              </div>
             </div>
+          </template>
+        </el-table-column>
+
+        <el-table-column label="提交状态" width="120" align="center">
+          <template #default="{ row }">
+            <el-tag v-if="row.submit_status_code" :type="submitStatusTagType(row.submit_status_code)" effect="dark">
+              {{ formatSubmitStatus(row.submit_status_code) }}
+            </el-tag>
+            <span v-else class="text-gray text-xs">--</span>
+          </template>
+        </el-table-column>
+
+        <el-table-column label="提交原始错误" min-width="340">
+          <template #default="{ row }">
+            <div
+              v-if="row.submit_error"
+              class="submit-error-raw"
+              :title="row.submit_error"
+            >{{ row.submit_error }}</div>
+            <span v-else class="text-gray text-xs">--</span>
           </template>
         </el-table-column>
         
@@ -453,6 +514,34 @@ const filteredDetails = computed(() => {
 }
 .message-text.is-error {
   color: #ef4444;
+}
+.submit-error-box {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+}
+.submit-error-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: #b91c1c;
+}
+.submit-error-body {
+  font-size: 12px;
+  line-height: 1.5;
+  color: #991b1b;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.submit-error-raw {
+  font-size: 12px;
+  line-height: 1.5;
+  color: #991b1b;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .capture-gallery {

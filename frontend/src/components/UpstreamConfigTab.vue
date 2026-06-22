@@ -22,6 +22,7 @@ const emit = defineEmits<{
     enabled?: boolean
     priority?: number
     base_url: string
+    proxy_url?: string | null
     notes?: string | null
   }): void
   (event: 'update', payload: {
@@ -32,6 +33,7 @@ const emit = defineEmits<{
       enabled?: boolean
       priority?: number
       base_url: string
+      proxy_url?: string | null
       notes?: string | null
     }
   }): void
@@ -72,6 +74,7 @@ const form = reactive({
   enabled: true,
   priority: 100,
   base_url: 'https://frontend.yqlaoqian111.com',
+  proxy_url: '',
   notes: '',
 })
 
@@ -108,6 +111,7 @@ function resetForm() {
   form.enabled = true
   form.priority = 100
   form.base_url = 'https://frontend.yqlaoqian111.com'
+  form.proxy_url = ''
   form.notes = ''
 }
 
@@ -123,6 +127,7 @@ function buildPayload() {
     enabled: form.enabled,
     priority: Number(form.priority) || 0,
     base_url: form.base_url.trim(),
+    proxy_url: form.proxy_url.trim() || null,
     notes: form.notes.trim() || null,
   }
 }
@@ -148,6 +153,7 @@ function startEdit(row: UpstreamConfigRecord) {
   form.enabled = row.enabled
   form.priority = row.priority
   form.base_url = row.base_url
+  form.proxy_url = row.proxy_url ?? ''
   form.notes = row.notes ?? ''
   upstreamDrawerVisible.value = true
 }
@@ -232,6 +238,11 @@ function submitMockData() {
             </template>
           </el-table-column>
           <el-table-column prop="base_url" label="基础地址" min-width="220" show-overflow-tooltip />
+          <el-table-column label="代理" min-width="220" show-overflow-tooltip>
+            <template #default="{ row }">
+              <span class="text-xs text-gray mono-text">{{ row.proxy_url || '直连' }}</span>
+            </template>
+          </el-table-column>
           <el-table-column label="运行统计" min-width="170" align="center">
             <template #default="{ row }">
               <div class="stats-group">
@@ -344,6 +355,14 @@ function submitMockData() {
 
         <el-form-item label="基础地址">
           <el-input v-model="form.base_url" placeholder="例如：http://127.0.0.1:8102" />
+        </el-form-item>
+
+        <el-form-item label="代理地址">
+          <el-input
+            v-model="form.proxy_url"
+            placeholder="可选，例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080"
+          />
+          <div class="field-tip">留空则直连上游；填写后适配器会按该代理访问当前上游</div>
         </el-form-item>
 
         <el-form-item label="备注">

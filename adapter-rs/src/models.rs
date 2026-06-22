@@ -28,6 +28,7 @@ pub struct UpstreamConfig {
     pub enabled: bool,
     pub priority: i32,
     pub base_url: String,
+    pub proxy_url: Option<String>,
     pub fetch_path: Option<String>,
     pub report_success_path: Option<String>,
     pub report_failure_path: Option<String>,
@@ -50,6 +51,7 @@ pub struct UpstreamInput {
     #[serde(default = "default_priority")]
     pub priority: i32,
     pub base_url: Option<String>,
+    pub proxy_url: Option<String>,
     pub fetch_path: Option<String>,
     pub report_success_path: Option<String>,
     pub report_failure_path: Option<String>,

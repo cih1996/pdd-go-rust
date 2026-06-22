@@ -33,7 +33,6 @@ const emit = defineEmits<{
 
 const searchDevice = ref('')
 const searchLog = ref('')
-const sortMode = ref<'default' | 'duration_desc'>('default')
 const expandedLogId = ref('')
 const deviceTemplateDialogVisible = ref(false)
 const editingDeviceId = ref('')
@@ -48,12 +47,9 @@ function taskElapsedSeconds(row: DeviceInfo) {
   return Math.max(0, Math.floor((nowTs.value - startedAt.getTime()) / 1000))
 }
 
-function taskPriority(row: DeviceInfo) {
-  const elapsed = taskElapsedSeconds(row)
-  if (elapsed >= TASK_DANGER_SECONDS) return 3
-  if (elapsed >= TASK_WARNING_SECONDS) return 2
-  if (hasActiveTask(row)) return 1
-  return 0
+function compareASCII(left: string, right: string) {
+  if (left === right) return 0
+  return left < right ? -1 : 1
 }
 
 function formatURLTemplateProgress(row: DeviceInfo) {
@@ -91,23 +87,7 @@ function templateDisplayText(item: UrlTemplateRecord, index: number) {
 const filteredDevices = computed(() => {
   const keyword = searchDevice.value.trim()
   const base = keyword ? props.devices.filter((d) => d.serial.includes(keyword)) : [...props.devices]
-
-  return [...base].sort((a, b) => {
-    const priorityDiff = taskPriority(b) - taskPriority(a)
-    if (priorityDiff !== 0) return priorityDiff
-
-    if (sortMode.value === 'duration_desc') {
-      const elapsedDiff = taskElapsedSeconds(b) - taskElapsedSeconds(a)
-      if (elapsedDiff !== 0) return elapsedDiff
-    }
-
-    if (a.running !== b.running) return a.running ? -1 : 1
-
-    const activeElapsedDiff = taskElapsedSeconds(b) - taskElapsedSeconds(a)
-    if (activeElapsedDiff !== 0) return activeElapsedDiff
-
-    return a.serial.localeCompare(b.serial)
-  })
+  return [...base].sort((a, b) => compareASCII(a.serial, b.serial))
 })
 
 interface TerminalTaskLogItem {
@@ -305,6 +285,7 @@ function formatStage(stage?: string) {
     loop_wait: '继续下一轮',
     success: '已成功',
     failure: '已失败',
+    submit_limit_stop: '提交限额停机',
   }
   return mapping[stage || ''] || stage || '-'
 }
@@ -453,10 +434,6 @@ onBeforeUnmount(() => {
             </div>
             
             <div class="filter-group">
-              <el-select v-model="sortMode" class="sort-select">
-                <el-option label="智能置顶" value="default" />
-                <el-option label="耗时最长" value="duration_desc" />
-              </el-select>
               <el-input
                 v-model="searchDevice"
                 placeholder="搜索设备号"

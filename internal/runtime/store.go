@@ -57,6 +57,8 @@ type DetailRecord struct {
 	CaptureURL        string   `json:"capture_url,omitempty"`
 	CaptureURLs       []string `json:"capture_urls,omitempty"`
 	Message           string   `json:"message,omitempty"`
+	SubmitStatusCode  int      `json:"submit_status_code,omitempty"`
+	SubmitError       string   `json:"submit_error,omitempty"`
 	TemplateID        string   `json:"template_id,omitempty"`
 	TemplateLabel     string   `json:"template_label,omitempty"`
 	RecognitionEngine string   `json:"recognition_engine,omitempty"`

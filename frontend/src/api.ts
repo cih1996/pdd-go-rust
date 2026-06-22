@@ -4,6 +4,7 @@ import type {
   MockDataImportResult,
   DebugSelectionTestResult,
   DeviceInfo,
+  PlatformAccountTestResult,
   PlatformAccountRecord,
   SystemConfig,
   TemplateRecord,
@@ -114,6 +115,7 @@ export function createUpstreamConfig(payload: {
   enabled?: boolean
   priority?: number
   base_url: string
+  proxy_url?: string | null
   notes?: string | null
 }): Promise<UpstreamConfigRecord> {
   return request('/api/upstreams', {
@@ -129,6 +131,7 @@ export function updateUpstreamConfig(upstreamId: string, payload: {
   enabled?: boolean
   priority?: number
   base_url: string
+  proxy_url?: string | null
   notes?: string | null
 }): Promise<UpstreamConfigRecord> {
   return request(`/api/upstreams/${upstreamId}`, {
@@ -186,6 +189,12 @@ export function togglePlatformAccount(accountId: string, enabled: boolean): Prom
 export function deletePlatformAccount(accountId: string): Promise<{ message: string }> {
   return request(`/api/platform-accounts/${accountId}`, {
     method: 'DELETE',
+  })
+}
+
+export function testPlatformAccountFetch(accountId: string): Promise<PlatformAccountTestResult> {
+  return request(`/api/platform-accounts/${accountId}/test-fetch`, {
+    method: 'POST',
   })
 }
 

@@ -17,6 +17,7 @@ type Record struct {
 	Enabled      bool      `json:"enabled"`
 	Priority     int       `json:"priority"`
 	BaseURL      string    `json:"base_url"`
+	ProxyURL     string    `json:"proxy_url,omitempty"`
 	Notes        string    `json:"notes,omitempty"`
 	CreatedAt    time.Time `json:"created_at"`
 	Stats        Stats     `json:"stats"`
@@ -29,6 +30,7 @@ type UpsertRequest struct {
 	Enabled      *bool  `json:"enabled"`
 	Priority     *int   `json:"priority"`
 	BaseURL      string `json:"base_url"`
+	ProxyURL     string `json:"proxy_url"`
 	Notes        string `json:"notes"`
 }
 
@@ -61,6 +63,7 @@ func NewStore(backend Backend) *Store {
 				Enabled:      true,
 				Priority:     10,
 				BaseURL:      "http://127.0.0.1:8091",
+				ProxyURL:     "",
 				Notes:        "默认联调 Rust 适配器中的本地模拟 provider",
 				CreatedAt:    time.Now().UTC(),
 				Stats:        Stats{},
@@ -73,6 +76,7 @@ func NewStore(backend Backend) *Store {
 				Enabled:      true,
 				Priority:     20,
 				BaseURL:      "http://127.0.0.1:8091",
+				ProxyURL:     "",
 				Notes:        "默认联调 Rust 适配器中的老钱 provider",
 				CreatedAt:    time.Now().UTC(),
 				Stats:        Stats{},
@@ -139,6 +143,7 @@ func (s *Store) Create(payload UpsertRequest) Record {
 		Enabled:      enabled,
 		Priority:     priority,
 		BaseURL:      baseURL,
+		ProxyURL:     strings.TrimSpace(payload.ProxyURL),
 		Notes:        strings.TrimSpace(payload.Notes),
 		CreatedAt:    time.Now().UTC(),
 		Stats:        Stats{},
@@ -172,6 +177,7 @@ func (s *Store) Update(id string, payload UpsertRequest) (Record, bool) {
 		if baseURL := strings.TrimSpace(payload.BaseURL); baseURL != "" {
 			updated.BaseURL = baseURL
 		}
+		updated.ProxyURL = strings.TrimSpace(payload.ProxyURL)
 		updated.Notes = strings.TrimSpace(payload.Notes)
 		s.items[index] = updated
 		s.persistLocked()

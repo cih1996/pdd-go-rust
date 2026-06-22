@@ -59,6 +59,17 @@ func (s *Store) List() []Record {
 	return result
 }
 
+func (s *Store) Get(accountID string) (Record, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, item := range s.items {
+		if item.ID == accountID {
+			return item, true
+		}
+	}
+	return Record{}, false
+}
+
 func (s *Store) Import(upstreamItem upstream.Record, lines string, enabled bool) []Record {
 	created := make([]Record, 0)
 	s.mu.Lock()

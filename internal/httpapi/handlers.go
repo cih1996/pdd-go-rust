@@ -466,6 +466,48 @@ func (d RouterDeps) handleTogglePlatformAccount(w http.ResponseWriter, r *http.R
 	writeJSON(w, http.StatusOK, item)
 }
 
+func (d RouterDeps) handleTestPlatformAccountFetch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+		return
+	}
+	accountID := strings.TrimSpace(r.PathValue("accountId"))
+	if accountID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing account id"})
+		return
+	}
+	accountItem, ok := d.Accounts.Get(accountID)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": "account not found"})
+		return
+	}
+	var upstreamItem upstream.Record
+	found := false
+	for _, item := range d.Upstream.List() {
+		if item.Code == accountItem.UpstreamCode {
+			upstreamItem = item
+			found = true
+			break
+		}
+	}
+	if !found {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "upstream not found"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+	defer cancel()
+	if err := d.syncAllUpstreamsToAdapter(ctx); err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
+		return
+	}
+	result, err := d.Tasks.TestPlatformAccountFetch(ctx, upstreamItem, accountItem)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
 func (d RouterDeps) handleDeletePlatformAccount(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})

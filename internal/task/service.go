@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"net/url"
@@ -94,6 +96,21 @@ type uploadCaptureResponse struct {
 	CaptureURL string `json:"capture_url"`
 }
 
+type adapterRequestError struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *adapterRequestError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if strings.TrimSpace(e.Message) == "" {
+		return fmt.Sprintf("adapter status %d", e.StatusCode)
+	}
+	return fmt.Sprintf("adapter status %d: %s", e.StatusCode, e.Message)
+}
+
 type sourceCandidate struct {
 	Upstream upstream.Record
 	Account  *account.Record
@@ -153,6 +170,20 @@ type groupedTask struct {
 	FinalStatus  string
 	FinalMessage string
 	Released     bool
+}
+
+type PlatformAccountTestResult struct {
+	Success         bool   `json:"success"`
+	Fetched         bool   `json:"fetched"`
+	Released        bool   `json:"released"`
+	UpstreamCode    string `json:"upstream_code"`
+	UpstreamType    string `json:"upstream_type"`
+	AccountID       string `json:"account_id"`
+	AccountName     string `json:"account_name"`
+	TaskID          string `json:"task_id,omitempty"`
+	UpstreamTaskRef string `json:"upstream_task_ref,omitempty"`
+	ItemCount       int    `json:"item_count,omitempty"`
+	Message         string `json:"message"`
 }
 
 func NewService(cfg config.Config, hub *ws.Hub, tpl *template.Store, visionEngine *vision.Engine, devices *device.Service, ups *upstream.Store, accounts *account.Store, runtimeStore *rt.Store) *Service {
@@ -253,7 +284,11 @@ func (s *Service) runWorker(ctx context.Context, deviceID string, mode string) {
 
 	defer func() {
 		shouldReleaseAll := s.cleanupWorkerOnExit(deviceID)
-		s.devices.SetCurrentTask(deviceID, nil)
+		if shouldKeepCurrentTaskSnapshot(s.devices.CurrentTask(deviceID)) {
+			s.devices.SetTaskRunning(deviceID, false)
+		} else {
+			s.devices.SetCurrentTask(deviceID, nil)
+		}
 		if shouldReleaseAll {
 			s.releaseAllGroupedTasks(context.Background(), "cancelled", "全部设备已停止，已主动释放已领取任务")
 		}
@@ -319,9 +354,6 @@ func (s *Service) runWorker(ctx context.Context, deviceID string, mode string) {
 			}
 		}
 
-		s.runtime.AddDetail(detail)
-		s.hub.Broadcast(ws.Event{Type: "detail", Data: map[string]any(detailToMap(detail))})
-
 		s.devices.RecordResult(deviceID, success)
 		if source.Account != nil {
 			s.accounts.UnbindDevice(source.Account.ID, deviceID)
@@ -335,8 +367,28 @@ func (s *Service) runWorker(ctx context.Context, deviceID string, mode string) {
 		}
 		if submission != nil {
 			if err := s.submitTaskWithMessage(ctx, deviceID, submission.Task, submission.SubmitType, submission.TaskItems, submission.Message); err != nil {
+				statusCode, submitError := parseAdapterSubmitFailure(err)
 				s.emitEvent("error", "提交任务失败", deviceID, map[string]any{"task_id": submission.Task.TaskID, "error": err.Error()})
+				detail.SubmitStatusCode = statusCode
+				detail.SubmitError = submitError
 				detail.Message = strings.TrimSpace(detail.Message + "; submit failed: " + err.Error())
+				if shouldAutoStopDeviceOnSubmitError(source, err) {
+					autoStopMessage := buildAutoStopMessageForSubmitError(err)
+					detail.Message = strings.TrimSpace(detail.Message + "; " + autoStopMessage)
+					s.devices.UpdateCurrentTask(deviceID, func(current *device.CurrentTask) {
+						current.CurrentStage = "submit_limit_stop"
+						current.CurrentMessage = autoStopMessage
+					})
+					s.runtime.AddDetail(detail)
+					s.hub.Broadcast(ws.Event{Type: "detail", Data: map[string]any(detailToMap(detail))})
+					s.emitEvent("error", "老钱提交达到 IP 限额，当前设备已自动停止", deviceID, map[string]any{
+						"task_id":             submission.Task.TaskID,
+						"submit_status_code": detail.SubmitStatusCode,
+						"submit_error":       detail.SubmitError,
+					})
+					s.emitState()
+					return
+				}
 			} else {
 				reportSuccess := submission.SubmitType == "success"
 				if source.Account != nil {
@@ -345,6 +397,9 @@ func (s *Service) runWorker(ctx context.Context, deviceID string, mode string) {
 				s.upstream.RecordReport(source.Upstream.Code, reportSuccess)
 			}
 		}
+
+		s.runtime.AddDetail(detail)
+		s.hub.Broadcast(ws.Event{Type: "detail", Data: map[string]any(detailToMap(detail))})
 
 		s.devices.SetCurrentTask(deviceID, &device.CurrentTask{
 			TaskID:         taskItem.Task.TaskID,
@@ -512,16 +567,21 @@ func (s *Service) submitTaskWithMessage(ctx context.Context, deviceID string, ta
 	}
 	defer resp.Body.Close()
 
-	var responseBody any
-	_ = json.NewDecoder(resp.Body).Decode(&responseBody)
+	responseBody, responseText := decodeAdapterResponse(resp.Body)
 	logRecord.ResponseStatus = resp.StatusCode
 	logRecord.ResponsePayload = responseBody
 	if resp.StatusCode >= http.StatusBadRequest {
-		logRecord.Error = fmt.Sprintf("adapter status %d", resp.StatusCode)
+		logRecord.Error = (&adapterRequestError{
+			StatusCode: resp.StatusCode,
+			Message:    buildAdapterErrorMessage(responseBody, responseText),
+		}).Error()
 	}
 	s.runtime.AddAdapterSubmitLog(logRecord)
 	if resp.StatusCode >= http.StatusBadRequest {
-		return fmt.Errorf("adapter status %d", resp.StatusCode)
+		return &adapterRequestError{
+			StatusCode: resp.StatusCode,
+			Message:    buildAdapterErrorMessage(responseBody, responseText),
+		}
 	}
 	return nil
 }
@@ -648,6 +708,81 @@ func detailItemIDs(taskItem clientTask, currentItem *clientTaskItem) (string, st
 		}
 	}
 	return strings.Join(goods, ", "), strings.Join(skus, ", ")
+}
+
+func parseAdapterSubmitFailure(err error) (int, string) {
+	var adapterErr *adapterRequestError
+	if errors.As(err, &adapterErr) {
+		return adapterErr.StatusCode, strings.TrimSpace(adapterErr.Message)
+	}
+	if err == nil {
+		return 0, ""
+	}
+	return 0, strings.TrimSpace(err.Error())
+}
+
+func shouldAutoStopDeviceOnSubmitError(source sourceCandidate, err error) bool {
+	statusCode, _ := parseAdapterSubmitFailure(err)
+	if statusCode != http.StatusServiceUnavailable {
+		return false
+	}
+	return strings.TrimSpace(source.Upstream.UpstreamType) == "laoqian_worker" || strings.TrimSpace(source.Upstream.Code) == "laoqian_worker"
+}
+
+func buildAutoStopMessageForSubmitError(err error) string {
+	statusCode, submitError := parseAdapterSubmitFailure(err)
+	if strings.TrimSpace(submitError) == "" {
+		return fmt.Sprintf("老钱上游提交返回 %d，当前设备已自动停止", statusCode)
+	}
+	return fmt.Sprintf("老钱上游提交返回 %d: %s；当前设备已自动停止", statusCode, strings.TrimSpace(submitError))
+}
+
+func shouldKeepCurrentTaskSnapshot(task *device.CurrentTask) bool {
+	if task == nil {
+		return false
+	}
+	switch strings.TrimSpace(task.CurrentStage) {
+	case "submit_limit_stop", "account_risk_stop":
+		return true
+	default:
+		return false
+	}
+}
+
+func decodeAdapterResponse(reader io.Reader) (any, string) {
+	raw, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, ""
+	}
+	text := strings.TrimSpace(string(raw))
+	if len(raw) == 0 {
+		return nil, text
+	}
+	var payload any
+	if err := json.Unmarshal(raw, &payload); err == nil {
+		return payload, text
+	}
+	return text, text
+}
+
+func buildAdapterErrorMessage(responseBody any, responseText string) string {
+	switch payload := responseBody.(type) {
+	case map[string]any:
+		for _, key := range []string{"detail", "message", "error"} {
+			value, ok := payload[key].(string)
+			if ok && strings.TrimSpace(value) != "" {
+				return strings.TrimSpace(value)
+			}
+		}
+	case string:
+		if strings.TrimSpace(payload) != "" {
+			return strings.TrimSpace(payload)
+		}
+	}
+	if strings.TrimSpace(responseText) != "" {
+		return strings.TrimSpace(responseText)
+	}
+	return ""
 }
 
 func (s *Service) emitEvent(level string, message string, deviceID string, payload map[string]any) {
@@ -806,6 +941,10 @@ func (s *Service) fetchCandidates() []sourceCandidate {
 }
 
 func (s *Service) fetchTaskForCandidate(ctx context.Context, candidate sourceCandidate) (*clientTask, error) {
+	return s.fetchTaskForCandidateWithOptions(ctx, candidate, true)
+}
+
+func (s *Service) fetchTaskForCandidateWithOptions(ctx context.Context, candidate sourceCandidate, recordFetchStats bool) (*clientTask, error) {
 	requestBody := map[string]any{
 		"device_id":   nil,
 		"source_code": candidate.Upstream.Code,
@@ -856,11 +995,49 @@ func (s *Service) fetchTaskForCandidate(ctx context.Context, candidate sourceCan
 	logRecord.UpstreamTaskRef = taskItem.UpstreamTaskRef
 	logRecord.ResponsePayload = taskItem
 	s.runtime.AddAdapterSubmitLog(logRecord)
-	if candidate.Account != nil {
+	if recordFetchStats && candidate.Account != nil {
 		s.accounts.RecordFetch(candidate.Account.ID)
 	}
-	s.upstream.RecordFetch(candidate.Upstream.Code)
+	if recordFetchStats {
+		s.upstream.RecordFetch(candidate.Upstream.Code)
+	}
 	return &taskItem, nil
+}
+
+func (s *Service) TestPlatformAccountFetch(ctx context.Context, upstreamItem upstream.Record, accountItem account.Record) (PlatformAccountTestResult, error) {
+	result := PlatformAccountTestResult{
+		Success:      true,
+		Fetched:      false,
+		Released:     false,
+		UpstreamCode: upstreamItem.Code,
+		UpstreamType: upstreamItem.UpstreamType,
+		AccountID:    accountItem.ID,
+		AccountName:  accountItem.Name,
+		Message:      "当前没有领取到任务",
+	}
+	candidate := sourceCandidate{
+		Upstream: upstreamItem,
+		Account:  &accountItem,
+		Token:    accountItem.Token,
+		Key:      "acct:" + accountItem.ID,
+	}
+	taskItem, err := s.fetchTaskForCandidateWithOptions(ctx, candidate, false)
+	if err != nil {
+		return PlatformAccountTestResult{}, err
+	}
+	if taskItem == nil {
+		return result, nil
+	}
+	result.Fetched = true
+	result.TaskID = taskItem.TaskID
+	result.UpstreamTaskRef = taskItem.UpstreamTaskRef
+	result.ItemCount = len(taskItem.TaskItems)
+	if err := s.submitTaskWithMessage(ctx, "", *taskItem, "cancelled", nil, "账号测试领取成功，已立即释放"); err != nil {
+		return PlatformAccountTestResult{}, err
+	}
+	result.Released = true
+	result.Message = fmt.Sprintf("测试领取成功，已立即释放，领取到 %d 个 SKU", len(taskItem.TaskItems))
+	return result, nil
 }
 
 func (s *Service) enqueuePendingGroup(task clientTask, source sourceCandidate, businessKey string) {

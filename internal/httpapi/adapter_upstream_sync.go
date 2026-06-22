@@ -24,6 +24,7 @@ type adapterUpstreamPayload struct {
 	Enabled      bool    `json:"enabled"`
 	Priority     int     `json:"priority"`
 	BaseURL      string  `json:"base_url,omitempty"`
+	ProxyURL     string  `json:"proxy_url,omitempty"`
 	Notes        *string `json:"notes,omitempty"`
 }
 
@@ -111,6 +112,7 @@ func buildAdapterUpstreamPayload(item upstream.Record) adapterUpstreamPayload {
 		Enabled:      item.Enabled,
 		Priority:     item.Priority,
 		BaseURL:      item.BaseURL,
+		ProxyURL:     item.ProxyURL,
 		Notes:        notesPtr(item.Notes),
 	}
 }

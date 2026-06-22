@@ -348,8 +348,8 @@ async fn fetch_from_mock_http(
         return Ok(None);
     };
 
-    let response = state
-        .client
+    let client = upstream_http_client(state, upstream)?;
+    let response = client
         .post(url.clone())
         .json(&json!({}))
         .send()
@@ -379,8 +379,8 @@ async fn fetch_from_laoqian_http(
     let (account, secret_key, explicit_upload_token) = parse_laoqian_token(raw_token)?;
     let origin = laoqian_origin(upstream);
     let login_url = format!("{}/api/user/login", upstream.base_url.trim_end_matches('/'));
-    let login_response = state
-        .client
+    let client = upstream_http_client(state, upstream)?;
+    let login_response = client
         .post(login_url)
         .header(reqwest::header::ORIGIN, origin.as_str())
         .json(&json!({"account": account, "secret_key": secret_key}))
@@ -416,8 +416,7 @@ async fn fetch_from_laoqian_http(
     let fetch_url = upstream_url(upstream, upstream.fetch_path.as_deref())
         .ok_or_else(|| "老钱上游缺少 fetch_path".to_string())?;
     for _attempt in 0..5 {
-        let fetch_response = state
-            .client
+        let fetch_response = client
             .post(fetch_url.clone())
             .header(reqwest::header::ORIGIN, origin.as_str())
             .header(reqwest::header::COOKIE, format!("token={session_token}"))
@@ -513,8 +512,8 @@ async fn submit_to_mock_http(
         "message": payload.message,
         "task_items": payload.task_items,
     });
-    let response = state
-        .client
+    let client = upstream_http_client(state, upstream)?;
+    let response = client
         .post(url)
         .json(&request_payload)
         .send()
@@ -569,7 +568,7 @@ async fn submit_to_laoqian_http(
         let mut skus = Vec::with_capacity(payload.task_items.len());
         for item in &payload.task_items {
             let (xiangqingjietu, youhuiquan) =
-                build_laoqian_capture_fields(state, context, item).await?;
+                build_laoqian_capture_fields(state, upstream, context, item).await?;
             skus.push(json!({
                 "sku_id": item.sku_id,
                 "status": "款式存在",
@@ -591,8 +590,8 @@ async fn submit_to_laoqian_http(
         })
     };
 
-    let response = state
-        .client
+    let client = upstream_http_client(state, upstream)?;
+    let response = client
         .post(url)
         .header(reqwest::header::ORIGIN, origin.as_str())
         .header(reqwest::header::COOKIE, format!("token={session}"))
@@ -1053,8 +1052,8 @@ async fn drop_laoqian_item(
     item_id: &str,
 ) -> Result<Value, String> {
     let origin = laoqian_origin(upstream);
-    let response = state
-        .client
+    let client = upstream_http_client(state, upstream)?;
+    let response = client
         .post(format!(
             "{}/api/item/drop",
             upstream.base_url.trim_end_matches('/')
@@ -1081,8 +1080,8 @@ async fn check_laoqian_link_goods_id(
     share_url: &str,
 ) -> Result<Value, String> {
     let origin = laoqian_origin(upstream);
-    let response = state
-        .client
+    let client = upstream_http_client(state, upstream)?;
+    let response = client
         .post(format!(
             "{}/api/item/check_link_goods_id",
             upstream.base_url.trim_end_matches('/')
@@ -1279,6 +1278,7 @@ mod tests {
 
 async fn build_laoqian_capture_fields(
     state: &AppState,
+    upstream: &UpstreamConfig,
     context: &IssuedTaskContext,
     item: &ClientSubmitTaskItem,
 ) -> Result<(Vec<String>, Vec<String>), String> {
@@ -1288,7 +1288,10 @@ async fn build_laoqian_capture_fields(
             continue;
         };
         uploaded
-            .push(upload_laoqian_capture(state, context, &capture.path, &capture.file_name).await?);
+            .push(
+                upload_laoqian_capture(state, upstream, context, &capture.path, &capture.file_name)
+                    .await?,
+            );
     }
     if uploaded.is_empty() {
         uploaded.extend(item.capture_urls.clone());
@@ -1307,6 +1310,7 @@ async fn build_laoqian_capture_fields(
 
 async fn upload_laoqian_capture(
     state: &AppState,
+    upstream: &UpstreamConfig,
     context: &IssuedTaskContext,
     path: &std::path::Path,
     file_name: &str,
@@ -1329,8 +1333,8 @@ async fn upload_laoqian_capture(
         .text("file_size", bytes.len().to_string())
         .text("item_id", format!("tw/{item_id}"))
         .text("token", token);
-    let response = state
-        .client
+    let client = upstream_http_client(state, upstream)?;
+    let response = client
         .put("https://file.yqlaoqian111.com/upload")
         .header(reqwest::header::ORIGIN, LAOQIAN_DEFAULT_ORIGIN)
         .multipart(form)
@@ -1349,4 +1353,22 @@ async fn upload_laoqian_capture(
         .and_then(|value| value.as_str())
         .map(|value| value.to_string())
         .ok_or_else(|| "老钱上传响应缺少 path".to_string())
+}
+
+fn upstream_http_client(state: &AppState, upstream: &UpstreamConfig) -> Result<reqwest::Client, String> {
+    let proxy_url = upstream
+        .proxy_url
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default();
+    if proxy_url.is_empty() {
+        return Ok(state.client.clone());
+    }
+    let proxy = reqwest::Proxy::all(proxy_url)
+        .map_err(|err| format!("上游代理配置无效: {err}"))?;
+    reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .proxy(proxy)
+        .build()
+        .map_err(|err| format!("创建上游代理客户端失败: {err}"))
 }

@@ -413,6 +413,7 @@ fn default_mock_upstream() -> UpstreamConfig {
         enabled: true,
         priority: 10,
         base_url: "".to_string(),
+        proxy_url: None,
         fetch_path: None,
         report_success_path: None,
         report_failure_path: None,
@@ -432,6 +433,7 @@ fn default_laoqian_upstream() -> UpstreamConfig {
         enabled: true,
         priority: 20,
         base_url: "https://frontend.yqlaoqian111.com".to_string(),
+        proxy_url: None,
         fetch_path: Some("/api/item/fetch".to_string()),
         report_success_path: Some("/api/item/work".to_string()),
         report_failure_path: Some("/api/item/drop".to_string()),
@@ -497,6 +499,10 @@ fn build_upstream_config(
                     .filter(|item| !item.is_empty())
             })
             .unwrap_or(default_base_url),
+        proxy_url: payload
+            .proxy_url
+            .and_then(|item| normalize_text(Some(item)))
+            .or_else(|| current.and_then(|item| item.proxy_url.clone())),
         fetch_path: normalize_text(payload.fetch_path)
             .or_else(|| current.and_then(|item| item.fetch_path.clone()))
             .or(fetch_path),

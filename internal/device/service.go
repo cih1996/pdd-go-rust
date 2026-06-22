@@ -187,6 +187,30 @@ func (s *Service) UpdateCurrentTask(serial string, mutate func(*CurrentTask)) {
 	s.items[serial] = item
 }
 
+func (s *Service) SetTaskRunning(serial string, running bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	item := s.items[serial]
+	if item.CurrentTask == nil {
+		item.Running = false
+		s.items[serial] = item
+		return
+	}
+	item.Running = running
+	s.items[serial] = item
+}
+
+func (s *Service) CurrentTask(serial string) *CurrentTask {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	item := s.items[serial]
+	if item.CurrentTask == nil {
+		return nil
+	}
+	task := *item.CurrentTask
+	return &task
+}
+
 func (s *Service) UpdateURLTemplateSelection(serial string, templateIDs []string) Info {
 	s.mu.Lock()
 	defer s.mu.Unlock()

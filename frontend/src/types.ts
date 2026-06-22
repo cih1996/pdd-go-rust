@@ -81,6 +81,8 @@ export interface DetailRecord {
   capture_url?: string | null
   capture_urls?: string[]
   message?: string | null
+  submit_status_code?: number | null
+  submit_error?: string | null
   template_id?: string | null
   template_label?: string | null
   recognition_engine?: RecognitionEngine | null
@@ -175,6 +177,20 @@ export interface PlatformAccountRecord {
   bound_device_ids: string[]
 }
 
+export interface PlatformAccountTestResult {
+  success: boolean
+  fetched: boolean
+  released: boolean
+  upstream_code: string
+  upstream_type: string
+  account_id: string
+  account_name: string
+  task_id?: string | null
+  upstream_task_ref?: string | null
+  item_count?: number | null
+  message: string
+}
+
 export interface UpstreamOption {
   code: string
   name: string
@@ -196,6 +212,7 @@ export interface UpstreamConfigRecord {
   enabled: boolean
   priority: number
   base_url: string
+  proxy_url?: string | null
   fetch_path?: string | null
   report_success_path?: string | null
   report_failure_path?: string | null
