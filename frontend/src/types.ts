@@ -102,6 +102,7 @@ export interface DashboardSummary {
   total: number
   success: number
   failure: number
+  daily?: Record<string, { total: number; success: number; failure: number }>
 }
 
 export interface PendingTaskRecord {
@@ -155,6 +156,7 @@ export interface SystemConfig {
   open_url_delay_seconds: number
   click_image_delay_seconds: number
   max_task_sku_count: number
+  external_api_enabled: boolean
   use_url_templates: boolean
   url_templates: UrlTemplateRecord[]
 }
@@ -276,7 +278,6 @@ export interface DesktopUpdateStatus {
 export interface DashboardState {
   devices: DeviceInfo[]
   templates: TemplateRecord[]
-  details: DetailRecord[]
   summary: DashboardSummary
   event_log: TaskEvent[]
   pending_tasks: PendingTaskRecord[]
@@ -287,6 +288,15 @@ export interface DashboardState {
   upstream_options: UpstreamOption[]
   service_links: ServiceLinkStatus[]
   adapter_state?: AdapterStatePayload | null
+}
+
+export interface DetailListResponse {
+  details: DetailRecord[]
+  total: number
+  offset: number
+  limit: number
+  has_more: boolean
+  summary: DashboardSummary
 }
 
 export interface DebugResult {

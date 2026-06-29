@@ -17,6 +17,7 @@ const form = reactive<SystemConfig>({
   open_url_delay_seconds: 2,
   click_image_delay_seconds: 1.2,
   max_task_sku_count: 0,
+  external_api_enabled: false,
   use_url_templates: false,
   url_templates: [],
 })
@@ -44,6 +45,7 @@ function normalizedConfigSignature(value: SystemConfig) {
     open_url_delay_seconds: Number(value.open_url_delay_seconds),
     click_image_delay_seconds: Number(value.click_image_delay_seconds),
     max_task_sku_count: Number(value.max_task_sku_count),
+    external_api_enabled: Boolean(value.external_api_enabled),
     use_url_templates: Boolean(value.use_url_templates),
     url_templates: (value.url_templates ?? []).map((item) => ({
       id: item.id,
@@ -61,6 +63,7 @@ function applyConfigToForm(value: SystemConfig) {
   form.open_url_delay_seconds = value.open_url_delay_seconds
   form.click_image_delay_seconds = value.click_image_delay_seconds
   form.max_task_sku_count = value.max_task_sku_count
+  form.external_api_enabled = value.external_api_enabled
   form.use_url_templates = value.use_url_templates
   form.url_templates = value.url_templates.map((item) => ({ ...item }))
   lastSyncedSignature = normalizedConfigSignature(value)
@@ -135,6 +138,7 @@ function submit() {
     open_url_delay_seconds: Number(form.open_url_delay_seconds),
     click_image_delay_seconds: Number(form.click_image_delay_seconds),
     max_task_sku_count: Number(form.max_task_sku_count),
+    external_api_enabled: form.external_api_enabled,
     use_url_templates: form.use_url_templates,
     url_templates: form.url_templates
       .map((item) => ({
@@ -215,6 +219,19 @@ const totalRiskCount = computed(() => form.url_templates.reduce((sum, item) => s
               <div class="field-tip text-warning">
                 <el-icon><Warning /></el-icon> 0 表示不限制。大于 0 时，并发领取到的任务如果 SKU 数量超过此值，会立即回传取消，不进入候选区。
               </div>
+            </el-form-item>
+
+            <el-form-item label="外部任务 API">
+              <div class="switch-row">
+                <el-switch
+                  v-model="form.external_api_enabled"
+                  inline-prompt
+                  active-text="开启"
+                  inactive-text="关闭"
+                />
+                <a href="/external-api.html" target="_blank" rel="noopener" class="doc-link">查看接口说明</a>
+              </div>
+              <div class="field-tip">开启后可通过业务端的外部接口直接领取任务和提交任务结果，不依赖 ADB 开始按钮。</div>
             </el-form-item>
           </el-form>
         </el-card>
@@ -420,6 +437,20 @@ https://mobile.yangkeduo.com/goods.html?goods_id=yyy"
 .card-title {
   display: flex;
   align-items: center;
+  font-size: 16px;
+.switch-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.doc-link {
+  color: #2563eb;
+  text-decoration: none;
+  font-size: 13px;
+}
+.doc-link:hover {
+  text-decoration: underline;
+}
   font-size: 16px;
   font-weight: 600;
   color: #1f2937;

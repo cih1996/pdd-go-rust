@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>外部任务 API 说明</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: #f8fafc;
+      color: #0f172a;
+      line-height: 1.6;
+    }
+    .wrap {
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 32px 20px 64px;
+    }
+    h1, h2 {
+      margin: 0 0 16px;
+    }
+    .card {
+      background: #fff;
+      border: 1px solid #e2e8f0;
+      border-radius: 12px;
+      padding: 20px;
+      margin-bottom: 20px;
+      box-shadow: 0 6px 18px rgba(15, 23, 42, 0.04);
+    }
+    code, pre {
+      font-family: Consolas, monospace;
+    }
+    pre {
+      background: #0f172a;
+      color: #e2e8f0;
+      padding: 16px;
+      border-radius: 10px;
+      overflow-x: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .muted {
+      color: #475569;
+    }
+    .badge {
+      display: inline-block;
+      padding: 2px 10px;
+      border-radius: 999px;
+      background: #dbeafe;
+      color: #1d4ed8;
+      font-size: 12px;
+      margin-left: 8px;
+    }
+    ul {
+      padding-left: 20px;
+      margin: 8px 0 0;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>外部任务 API 说明 <span class="badge">业务端统一入口</span></h1>
+    <p class="muted">先在业务端后台配置好上游和平台账号，再到“系统核心配置”中开启“外部任务 API”。外部设备不直接调用适配器，只调用业务端这组接口。</p>
+
+    <div class="card">
+      <h2>调用顺序</h2>
+      <ul>
+        <li>如需复用业务端“跳转链接模板路由”，先调用 <code>GET /api/external/url-templates</code> 拉取可用链接模板。</li>
+        <li>先调用 <code>POST /api/external/fetch-task</code> 领取任务。</li>
+        <li>如果返回 <code>has_task = true</code>，执行任务时可自行选一个模板链接打开，完成后调用 <code>POST /api/external/submit-task</code> 回传结果。</li>
+        <li>截图直接放在 <code>captures[].content_base64</code> 里，服务端会自动生成文件名并上传，任务明细页可直接看到快照。</li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <h2>1. 获取跳转链接模板</h2>
+      <p><code>GET /api/external/url-templates</code></p>
+      <pre>{
+  "success": true,
+  "use_url_templates": true,
+  "templates": [
+    {
+      "id": "urltpl_a",
+      "name": "模板A",
+      "template": "https://mobile.yangkeduo.com/order_checkout.html?goods_id=100&sku_id=200",
+      "trigger_count": 12,
+      "success_count": 9,
+      "risk_count": 1
+    }
+  ]
+}</pre>
+      <p class="muted">返回的是业务端当前配置的跳转链接模板列表。你执行任务时如果用了其中某个链接，提交结果时把对应的 <code>template_id</code> 一并带回，业务端就会按原有 ADB 逻辑记录触发、成功、风控统计，并写入任务明细。</p>
+    </div>
+
+    <div class="card">
+      <h2>2. 领取任务</h2>
+      <p><code>POST /api/external/fetch-task</code></p>
+      <pre>{
+  "worker_id": "cloud-001",
+  "worker_name": "云手机-001",
+  "source_code": "laoqian_worker"
+}</pre>
+      <p class="muted">字段说明：<code>worker_id</code> 必填，用于标识外部设备；<code>worker_name</code> 可选；<code>source_code</code> 可选，不填时由业务端自动选择可用账号和上游。</p>
+      <pre>{
+  "success": true,
+  "has_task": true,
+  "message": "ok",
+  "task": {
+    "task_id": "laoqian_worker_xxx",
+    "upstream_task_ref": "749844241676087",
+    "source_code": "laoqian_worker",
+    "source_name": "老钱真实上游",
+    "account_id": "acct_xxx",
+    "account_name": "账号A",
+    "task_items": [
+      {
+        "goods_id": "925751104085",
+        "sku_id": "1874695437353",
+        "source_url": "https://example.com/item",
+        "step_index": 0
+      }
+    ]
+  }
+}</pre>
+      <pre>{
+  "success": true,
+  "has_task": false,
+  "message": "当前暂无可领取任务",
+  "task": null
+}</pre>
+    </div>
+
+    <div class="card">
+      <h2>3. 提交任务</h2>
+      <p><code>POST /api/external/submit-task</code></p>
+      <pre>{
+  "task_id": "laoqian_worker_xxx",
+  "worker_id": "cloud-001",
+  "device_id": "cloud-001",
+  "template_id": "urltpl_a",
+  "result": "success",
+  "message": "执行完成",
+  "task_items": [
+    {
+      "goods_id": "925751104085",
+      "sku_id": "1874695437353",
+      "recognition": "success_image",
+      "message": "命中成功图",
+      "captures": [
+        {
+          "content_base64": "iVBORw0KGgoAAAANSUhEUgAA...",
+          "content_type": "image/png"
+        }
+      ]
+    }
+  ]
+}</pre>
+      <p class="muted"><code>result</code> 只支持 <code>success</code>、<code>failure</code>、<code>cancelled</code>。如果使用了跳转链接模板，请把 <code>template_id</code> 一并提交；图片文件名不用传，服务端会自动生成。</p>
+      <pre>{
+  "success": true,
+  "message": "任务已提交",
+  "task_id": "laoqian_worker_xxx",
+  "device_id": "cloud-001",
+  "detail_ids": ["detail_xxx"],
+  "capture_urls": ["/api/captures/cap_xxx"]
+}</pre>
+    </div>
+
+    <div class="card">
+      <h2>注意事项</h2>
+      <ul>
+        <li>重复任务会被业务端按现有业务键去重，避免多个外部设备或 ADB 设备重复执行同一任务。</li>
+        <li>如果接口返回错误，错误信息会尽量透传到任务明细和提交日志里。</li>
+        <li>若未传 <code>device_id</code>，业务端会默认使用 <code>ext:&lt;worker_id&gt;</code> 作为明细里的设备编号。</li>
+        <li>若某个任务项的 <code>recognition</code> 明确回传 <code>account_risk</code>，业务端会把对应 <code>template_id</code> 记为一次风控。</li>
+      </ul>
+    </div>
+  </div>
+</body>
+</html>

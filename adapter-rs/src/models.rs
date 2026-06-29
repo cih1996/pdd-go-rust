@@ -68,7 +68,11 @@ pub struct ToggleUpstreamRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientTaskItem {
     pub goods_id: String,
+    #[serde(default)]
+    pub goods_name: Option<String>,
     pub sku_id: String,
+    #[serde(default)]
+    pub sku_name: Vec<String>,
     #[serde(default)]
     pub source_url: Option<String>,
     #[serde(default)]
@@ -212,6 +216,8 @@ pub struct IssuedTaskContext {
     pub goods_id: Option<String>,
     pub share_url: Option<String>,
     pub source_urls: Vec<String>,
+    pub laoqian_account: Option<String>,
+    pub laoqian_secret_key: Option<String>,
     pub laoqian_session_token: Option<String>,
     pub laoqian_upload_token: Option<String>,
 }

@@ -10,6 +10,7 @@ import {
   deletePlatformAccount,
   deleteTemplate,
   exportTemplates,
+  fetchDetails,
   fetchState,
   getAssetUrl,
   getWsUrl,
@@ -88,15 +89,21 @@ const connectEndpoint = ref('')
 const selectedDevices = ref<string[]>([])
 const inspectedDeviceId = ref('')
 const debugResult = ref<DebugResult | null>(null)
+const DETAIL_PAGE_SIZE = 30
 const debugCapture = ref<DebugCaptureResult | null>(null)
 const debugSelectionResult = ref<DebugSelectionTestResult | null>(null)
 const templateTestResult = ref<TemplateTestResult | null>(null)
 const debugStreamEvents = ref<Array<{ type: string; data: DebugRunStreamEvent }>>([])
 const errorMessage = ref('')
+const detailItems = ref<DetailRecord[]>([])
+const detailSummary = ref({ total: 0, success: 0, failure: 0 })
+const detailLoading = ref(false)
+const detailTotal = ref(0)
+const detailHasMore = ref(false)
+const detailRequestedLimit = ref(DETAIL_PAGE_SIZE)
 const state = ref<DashboardState>({
   devices: [],
   templates: [],
-  details: [],
   summary: { total: 0, success: 0, failure: 0 },
   event_log: [],
   pending_tasks: [],
@@ -105,6 +112,7 @@ const state = ref<DashboardState>({
     open_url_delay_seconds: 2,
     click_image_delay_seconds: 1.2,
     max_task_sku_count: 0,
+    external_api_enabled: false,
     use_url_templates: false,
     url_templates: [],
   },
@@ -124,7 +132,7 @@ const activeDebugRequestId = ref('')
 
 const devices = computed<DeviceInfo[]>(() => state.value.devices)
 const templates = computed<TemplateRecord[]>(() => state.value.templates)
-const details = computed<DetailRecord[]>(() => state.value.details)
+const details = computed<DetailRecord[]>(() => detailItems.value)
 const eventLog = computed<TaskEvent[]>(() => state.value.event_log)
 const pendingTasks = computed<PendingTaskRecord[]>(() => state.value.pending_tasks)
 const adapterSubmitLogs = computed<AdapterSubmitLogRecord[]>(() => state.value.adapter_submit_logs)
@@ -193,7 +201,6 @@ function normalizeState(nextState: DashboardState): DashboardState {
     })),
     adapter_submit_logs: (nextState.adapter_submit_logs ?? []).map(normalizeAdapterSubmitLog),
     templates: nextState.templates.map((item) => ({ ...item, image_url: getAssetUrl(item.image_url) })),
-    details: nextState.details.map(normalizeDetail),
     service_links: nextState.service_links ?? [],
     adapter_state: normalizeAdapterState(nextState.adapter_state),
   }
@@ -203,10 +210,50 @@ function mergeState(nextState: DashboardState) {
   state.value = normalizeState(nextState)
 }
 
-async function loadState() {
+function isDetailInRange(timestamp: string, currentRangeKey: string): boolean {
+  const date = new Date(timestamp)
+  const now = new Date()
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  const yesterday = new Date(today)
+  yesterday.setDate(yesterday.getDate() - 1)
+  const sevenDaysAgo = new Date(today)
+  sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 6)
+  if (currentRangeKey === 'today') {
+    return date >= today
+  }
+  if (currentRangeKey === 'yesterday') {
+    return date >= yesterday && date < today
+  }
+  if (currentRangeKey === '7d') {
+    return date >= sevenDaysAgo
+  }
+  return true
+}
+
+async function loadDetails(reset = false) {
+  if (reset) {
+    detailRequestedLimit.value = DETAIL_PAGE_SIZE
+  }
+  detailLoading.value = true
+  try {
+    const response = await fetchDetails(rangeKey.value, detailRequestedLimit.value, 0)
+    detailItems.value = response.details.map(normalizeDetail)
+    detailTotal.value = response.total
+    detailHasMore.value = response.has_more
+    detailSummary.value = response.summary
+  } finally {
+    detailLoading.value = false
+  }
+}
+
+async function loadState(resetDetails = false) {
   loading.value = true
   try {
-    mergeState(await fetchState(rangeKey.value))
+    const [nextState] = await Promise.all([
+      fetchState(rangeKey.value),
+      loadDetails(resetDetails),
+    ])
+    mergeState(nextState)
     errorMessage.value = ''
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '加载失败'
@@ -254,7 +301,7 @@ function connectWs() {
   ws.onopen = () => {
     wsConnected.value = true
     stopStatePoll()
-    void loadState()
+    void loadState(true)
   }
   ws.onmessage = (event) => {
     const payload = JSON.parse(event.data) as { type: string; data: DashboardState | TaskEvent | DetailRecord | DebugRunStreamEvent }
@@ -263,7 +310,17 @@ function connectWs() {
     } else if (payload.type === 'event') {
       state.value.event_log = [normalizeEvent(payload.data as TaskEvent), ...state.value.event_log].slice(0, 200)
     } else if (payload.type === 'detail') {
-      state.value.details = [normalizeDetail(payload.data as DetailRecord), ...state.value.details].slice(0, 200)
+      const nextDetail = normalizeDetail(payload.data as DetailRecord)
+      const exists = detailItems.value.some((item) => item.id === nextDetail.id)
+      if (!isDetailInRange(nextDetail.timestamp, rangeKey.value)) {
+        return
+      }
+      if (!exists) {
+        detailTotal.value += 1
+      }
+      detailItems.value = [nextDetail, ...detailItems.value.filter((item) => item.id !== nextDetail.id)]
+        .slice(0, detailRequestedLimit.value)
+      detailHasMore.value = detailItems.value.length < detailTotal.value
     } else if ((payload.data as DebugRunStreamEvent)?.request_id && (payload.data as DebugRunStreamEvent).request_id === activeDebugRequestId.value) {
       const debugData = payload.data as DebugRunStreamEvent
       if (debugData.capture_url) {
@@ -598,7 +655,12 @@ async function handleClearDetails() {
   try {
     await clearDetails()
     ElMessage.success('执行明细已清空')
-    await loadState()
+    detailItems.value = []
+    detailSummary.value = { total: 0, success: 0, failure: 0 }
+    detailTotal.value = 0
+    detailHasMore.value = false
+    detailRequestedLimit.value = DETAIL_PAGE_SIZE
+    await loadState(true)
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '清空执行明细失败'
     ElMessage.error(errorMessage.value)
@@ -607,13 +669,20 @@ async function handleClearDetails() {
   }
 }
 
-async function handleSaveSystemConfig(payload: {
-  open_url_delay_seconds: number
-  click_image_delay_seconds: number
-  max_task_sku_count: number
-  use_url_templates: boolean
-  url_templates: SystemConfig['url_templates']
-}) {
+async function handleLoadMoreDetails() {
+  if (detailLoading.value || !detailHasMore.value) {
+    return
+  }
+  detailRequestedLimit.value += DETAIL_PAGE_SIZE
+  try {
+    await loadDetails()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '加载更多明细失败'
+    ElMessage.error(errorMessage.value)
+  }
+}
+
+async function handleSaveSystemConfig(payload: SystemConfig) {
   savingSystemConfig.value = true
   try {
     const nextConfig = await updateSystemConfig(payload)
@@ -1107,10 +1176,15 @@ onUnmounted(() => {
         <DetailTab
           v-if="activeTab === 'detail'"
           :summary="state.summary"
+          :detail-summary="detailSummary"
           :details="details"
+          :detail-total="detailTotal"
+          :detail-loading="detailLoading"
+          :detail-has-more="detailHasMore"
           :range-key="rangeKey"
           :clearing="clearingDetails"
-          @update:range-key="rangeKey = $event; loadState()"
+          @update:range-key="rangeKey = $event; loadState(true)"
+          @load-more="handleLoadMoreDetails"
           @clear-details="handleClearDetails"
         />
 

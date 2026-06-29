@@ -499,10 +499,10 @@ fn build_upstream_config(
                     .filter(|item| !item.is_empty())
             })
             .unwrap_or(default_base_url),
-        proxy_url: payload
-            .proxy_url
-            .and_then(|item| normalize_text(Some(item)))
-            .or_else(|| current.and_then(|item| item.proxy_url.clone())),
+        proxy_url: match payload.proxy_url {
+            Some(item) => normalize_text(Some(item)),
+            None => current.and_then(|item| item.proxy_url.clone()),
+        },
         fetch_path: normalize_text(payload.fetch_path)
             .or_else(|| current.and_then(|item| item.fetch_path.clone()))
             .or(fetch_path),

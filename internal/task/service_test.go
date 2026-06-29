@@ -1,12 +1,21 @@
 package task
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"unified-server/internal/account"
+	"unified-server/internal/config"
 	"unified-server/internal/device"
 	rt "unified-server/internal/runtime"
 	"unified-server/internal/template"
+	"unified-server/internal/upstream"
+	"unified-server/internal/ws"
 )
 
 func TestRewriteTemplateURL_ReplacesNestedFromURL(t *testing.T) {
@@ -194,6 +203,349 @@ func TestRememberFirstCapture_KeepsFirstCapture(t *testing.T) {
 	if string(second) != "first-click" {
 		t.Fatalf("expected first click capture to be preserved, got %q", string(second))
 	}
+}
+
+func TestSubmitExternalTask_RecordsURLTemplateSuccess(t *testing.T) {
+	service, cleanup := newExternalSubmitTestService(t)
+	defer cleanup()
+
+	taskItem := reserveTestExternalClaim(t, service)
+	_, err := service.SubmitExternalTask(context.Background(), ExternalSubmitRequest{
+		TaskID:     taskItem.TaskID,
+		WorkerID:   "worker-1",
+		TemplateID: "tpl-1",
+		Result:     "success",
+		TaskItems: []ExternalSubmitTaskItem{
+			{
+				GoodsID:     "123456",
+				SKUID:       "6812323",
+				Recognition: "success_image",
+				Message:     "命中成功图",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("expected submit success, got %v", err)
+	}
+
+	cfg := service.runtime.SystemConfig()
+	if len(cfg.URLTemplates) != 1 {
+		t.Fatalf("expected 1 url template, got %d", len(cfg.URLTemplates))
+	}
+	if cfg.URLTemplates[0].TriggerCount != 1 || cfg.URLTemplates[0].SuccessCount != 1 || cfg.URLTemplates[0].RiskCount != 0 {
+		t.Fatalf("unexpected url template stats: %+v", cfg.URLTemplates[0])
+	}
+
+	_, _, details, _, _, _ := service.runtime.Snapshot()
+	if len(details) != 1 {
+		t.Fatalf("expected 1 detail record, got %d", len(details))
+	}
+	if details[0].TemplateID != "tpl-1" || details[0].TemplateLabel != "模板一" {
+		t.Fatalf("expected detail to include template info, got %+v", details[0])
+	}
+	if !strings.Contains(details[0].URL, "goods_id=123456") || !strings.Contains(details[0].URL, "sku_id=6812323") {
+		t.Fatalf("expected detail url to use rewritten template url, got %s", details[0].URL)
+	}
+}
+
+func TestSubmitExternalTask_RecordsURLTemplateRisk(t *testing.T) {
+	service, cleanup := newExternalSubmitTestService(t)
+	defer cleanup()
+
+	taskItem := reserveTestExternalClaim(t, service)
+	_, err := service.SubmitExternalTask(context.Background(), ExternalSubmitRequest{
+		TaskID:     taskItem.TaskID,
+		WorkerID:   "worker-1",
+		TemplateID: "tpl-1",
+		Result:     "failure",
+		TaskItems: []ExternalSubmitTaskItem{
+			{
+				GoodsID:     "123456",
+				SKUID:       "6812323",
+				Recognition: "account_risk",
+				Message:     "账号风控",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("expected submit success, got %v", err)
+	}
+
+	cfg := service.runtime.SystemConfig()
+	if len(cfg.URLTemplates) != 1 {
+		t.Fatalf("expected 1 url template, got %d", len(cfg.URLTemplates))
+	}
+	if cfg.URLTemplates[0].TriggerCount != 1 || cfg.URLTemplates[0].SuccessCount != 0 || cfg.URLTemplates[0].RiskCount != 1 {
+		t.Fatalf("unexpected url template stats: %+v", cfg.URLTemplates[0])
+	}
+}
+
+func TestSubmitExternalTask_SubmitFailureMarksDetailFailureAndDoesNotCountTemplateSuccess(t *testing.T) {
+	service, cleanup := newExternalSubmitTestServiceWithHandler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/client/submit-task" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"detail":"上传老钱截图失败: 无当前题目作业权限，请重新领题","success":false}`))
+	}))
+	defer cleanup()
+
+	taskItem := reserveTestExternalClaim(t, service)
+	_, err := service.SubmitExternalTask(context.Background(), ExternalSubmitRequest{
+		TaskID:     taskItem.TaskID,
+		WorkerID:   "worker-1",
+		TemplateID: "tpl-1",
+		Result:     "success",
+		TaskItems: []ExternalSubmitTaskItem{
+			{
+				GoodsID:     "123456",
+				SKUID:       "6812323",
+				Recognition: "success_image",
+				Message:     "命中成功图",
+			},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected submit failure")
+	}
+
+	cfg := service.runtime.SystemConfig()
+	if len(cfg.URLTemplates) != 1 {
+		t.Fatalf("expected 1 url template, got %d", len(cfg.URLTemplates))
+	}
+	if cfg.URLTemplates[0].TriggerCount != 1 || cfg.URLTemplates[0].SuccessCount != 0 || cfg.URLTemplates[0].RiskCount != 0 {
+		t.Fatalf("unexpected url template stats after submit failure: %+v", cfg.URLTemplates[0])
+	}
+
+	_, _, details, _, _, _ := service.runtime.Snapshot()
+	if len(details) != 1 {
+		t.Fatalf("expected 1 detail record, got %d", len(details))
+	}
+	if details[0].Status != "failure" {
+		t.Fatalf("expected detail status failure after adapter submit error, got %+v", details[0])
+	}
+	if details[0].SubmitStatusCode != http.StatusBadRequest {
+		t.Fatalf("expected submit status code 400, got %+v", details[0])
+	}
+	if !strings.Contains(details[0].SubmitError, "无当前题目作业权限，请重新领题") {
+		t.Fatalf("expected raw submit error to be preserved, got %+v", details[0])
+	}
+}
+
+func TestReleaseExpiredGroupedTasks_ReleasesTimedOutGroup(t *testing.T) {
+	var submitRequests []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/client/submit-task" {
+			http.NotFound(w, r)
+			return
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode submit payload: %v", err)
+		}
+		submitRequests = append(submitRequests, payload)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":true}`))
+	}))
+	defer server.Close()
+
+	hub := ws.NewHub()
+	service := NewService(
+		config.Config{AdapterBaseURL: server.URL},
+		hub,
+		template.NewStore(nil),
+		nil,
+		device.NewService(hub, ""),
+		upstream.NewStore(nil),
+		account.NewStore(nil),
+		rt.NewStore(nil),
+	)
+	service.client = server.Client()
+
+	taskItem := clientTask{
+		TaskID:          "task-timeout-1",
+		UpstreamTaskRef: "ref-timeout-1",
+		SourceCode:      "source-timeout",
+		SourceName:      "超时上游",
+		TaskItems: []clientTaskItem{
+			{GoodsID: "g1", SKUID: "s1", StepIndex: 0},
+			{GoodsID: "g2", SKUID: "s2", StepIndex: 1},
+		},
+	}
+	candidate := sourceCandidate{Upstream: upstream.Record{Code: "source-timeout"}}
+	service.enqueuePendingGroup(taskItem, candidate, buildBusinessKey(taskItem))
+
+	parentKey := buildBusinessKey(taskItem)
+	service.mu.Lock()
+	service.groups[parentKey].PrefetchedAt = time.Now().Add(-groupTaskTimeout - time.Second).UTC().Format(time.RFC3339)
+	service.mu.Unlock()
+
+	service.releaseExpiredGroupedTasks(context.Background())
+
+	if len(submitRequests) != 1 {
+		t.Fatalf("expected 1 cancelled submit request, got %d", len(submitRequests))
+	}
+	if submitRequests[0]["type"] != "cancelled" {
+		t.Fatalf("expected cancelled submit type, got %+v", submitRequests[0])
+	}
+	if service.pendingCount() != 0 {
+		t.Fatalf("expected pending queue to be empty after release, got %d", service.pendingCount())
+	}
+	service.mu.Lock()
+	_, groupExists := service.groups[parentKey]
+	service.mu.Unlock()
+	if groupExists {
+		t.Fatal("expected timed out grouped task to be removed")
+	}
+	_, _, _, pending, _, _ := service.runtime.Snapshot()
+	if len(pending) != 0 {
+		t.Fatalf("expected runtime pending tasks to be empty, got %d", len(pending))
+	}
+}
+
+func TestReleaseExpiredGroupedTasks_DoesNotReleaseStartedGroup(t *testing.T) {
+	var submitRequests []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/client/submit-task" {
+			http.NotFound(w, r)
+			return
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode submit payload: %v", err)
+		}
+		submitRequests = append(submitRequests, payload)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":true}`))
+	}))
+	defer server.Close()
+
+	hub := ws.NewHub()
+	service := NewService(
+		config.Config{AdapterBaseURL: server.URL},
+		hub,
+		template.NewStore(nil),
+		nil,
+		device.NewService(hub, ""),
+		upstream.NewStore(nil),
+		account.NewStore(nil),
+		rt.NewStore(nil),
+	)
+	service.client = server.Client()
+
+	taskItem := clientTask{
+		TaskID:          "task-started-1",
+		UpstreamTaskRef: "ref-started-1",
+		SourceCode:      "source-started",
+		SourceName:      "开始执行上游",
+		TaskItems: []clientTaskItem{
+			{GoodsID: "g1", SKUID: "s1", StepIndex: 0},
+			{GoodsID: "g2", SKUID: "s2", StepIndex: 1},
+		},
+	}
+	candidate := sourceCandidate{Upstream: upstream.Record{Code: "source-started"}}
+	service.enqueuePendingGroup(taskItem, candidate, buildBusinessKey(taskItem))
+
+	parentKey := buildBusinessKey(taskItem)
+	service.mu.Lock()
+	service.groups[parentKey].PrefetchedAt = time.Now().Add(-groupTaskTimeout - time.Second).UTC().Format(time.RFC3339)
+	service.mu.Unlock()
+
+	if _, _, ok := service.takePendingTask(); !ok {
+		t.Fatal("expected a child task to move into active state")
+	}
+
+	service.releaseExpiredGroupedTasks(context.Background())
+
+	if len(submitRequests) != 0 {
+		t.Fatalf("expected no cancel submit for started group, got %d", len(submitRequests))
+	}
+	service.mu.Lock()
+	group := service.groups[parentKey]
+	activeCount := len(group.Active)
+	pendingCount := len(group.Pending)
+	service.mu.Unlock()
+	if group == nil {
+		t.Fatal("expected started grouped task to remain in queue state")
+	}
+	if activeCount != 1 || pendingCount != 1 {
+		t.Fatalf("expected started group to remain intact, got active=%d pending=%d", activeCount, pendingCount)
+	}
+}
+
+func newExternalSubmitTestService(t *testing.T) (*Service, func()) {
+	return newExternalSubmitTestServiceWithHandler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/client/submit-task" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":true}`))
+	}))
+}
+
+func newExternalSubmitTestServiceWithHandler(t *testing.T, handler http.Handler) (*Service, func()) {
+	t.Helper()
+
+	server := httptest.NewServer(handler)
+
+	hub := ws.NewHub()
+	runtimeStore := rt.NewStore(nil)
+	runtimeStore.UpdateSystemConfig(rt.SystemConfig{
+		UseURLTemplates: true,
+		URLTemplates: []rt.URLTemplateRecord{
+			{
+				ID:       "tpl-1",
+				Name:     "模板一",
+				Template: "https://mobile.yangkeduo.com/order_checkout.html?goods_id=1&sku_id=2",
+			},
+		},
+	})
+	service := NewService(
+		config.Config{AdapterBaseURL: server.URL},
+		hub,
+		template.NewStore(nil),
+		nil,
+		device.NewService(hub, ""),
+		upstream.NewStore(nil),
+		account.NewStore(nil),
+		runtimeStore,
+	)
+	service.client = server.Client()
+
+	return service, server.Close
+}
+
+func reserveTestExternalClaim(t *testing.T, service *Service) clientTask {
+	t.Helper()
+
+	taskItem := clientTask{
+		TaskID:          "task-1",
+		UpstreamTaskRef: "ref-1",
+		SourceCode:      "source-1",
+		SourceName:      "测试上游",
+		AccountID:       "acct-1",
+		AccountName:     "测试账号",
+		TaskItems: []clientTaskItem{
+			{
+				GoodsID:   "123456",
+				SKUID:     "6812323",
+				SourceURL: "https://origin.example.com/item",
+				StepIndex: 0,
+			},
+		},
+	}
+	ok := service.reserveExternalClaim(taskItem, sourceCandidate{
+		Upstream: upstream.Record{Code: "source-1"},
+		Account:  &account.Record{ID: "acct-1", Name: "测试账号"},
+		Key:      "acct:acct-1",
+	}, "worker-1", "Worker 1")
+	if !ok {
+		t.Fatal("expected external claim to be reserved")
+	}
+	return taskItem
 }
 
 func clientSystemConfig() rt.SystemConfig {

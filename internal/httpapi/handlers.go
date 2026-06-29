@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"unified-server/internal/runtime"
+	"unified-server/internal/task"
 	"unified-server/internal/upstream"
 )
 
@@ -54,14 +56,14 @@ func (d RouterDeps) handleState(w http.ResponseWriter, r *http.Request) {
 			Payload: map[string]any{"error": err.Error()},
 		})
 	}
-	summary, events, details, pending, adapterLogs, systemConfig := d.Runtime.Snapshot()
+	summary, events, _, pending, adapterLogs, systemConfig := d.Runtime.Snapshot()
 	if len(events) == 0 {
 		d.Runtime.AddEvent(runtime.EventRecord{
 			Level:   "info",
 			Message: "Go unified-server runtime is ready",
 			Payload: map[string]any{"log_kind": "system"},
 		})
-		summary, events, details, pending, adapterLogs, systemConfig = d.Runtime.Snapshot()
+		summary, events, _, pending, adapterLogs, systemConfig = d.Runtime.Snapshot()
 	}
 	adapterState, adapterErr := d.fetchAdapterState(ctx)
 	adapterMessage := "adapter state ready"
@@ -111,7 +113,6 @@ func (d RouterDeps) handleState(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"devices":             d.Devices.List(),
 		"templates":           d.Tpl.List(),
-		"details":             details,
 		"summary":             summary,
 		"event_log":           events,
 		"pending_tasks":       pending,
@@ -123,6 +124,128 @@ func (d RouterDeps) handleState(w http.ResponseWriter, r *http.Request) {
 		"service_links":       serviceLinks,
 		"adapter_state":       adapterState,
 	})
+}
+
+func (d RouterDeps) handleDetails(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		rangeKey := strings.TrimSpace(r.URL.Query().Get("range_key"))
+		offset := parsePositiveIntQuery(r, "offset", 0)
+		limit := parsePositiveIntQuery(r, "limit", 30)
+		if limit <= 0 {
+			limit = 30
+		}
+		details := filterDetailsByRange(d.Runtime.Details(), rangeKey)
+		total := len(details)
+		rangeSummary := buildRangeSummary(d.Runtime.Summary(), rangeKey)
+		if offset > total {
+			offset = total
+		}
+		end := offset + limit
+		if end > total {
+			end = total
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"details":  details[offset:end],
+			"total":    total,
+			"offset":   offset,
+			"limit":    limit,
+			"has_more": end < total,
+			"summary":  rangeSummary,
+		})
+	case http.MethodDelete:
+		d.Runtime.ClearDetails()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"success": true,
+			"message": "执行明细已清空",
+		})
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func buildRangeSummary(summary runtime.Summary, rangeKey string) runtime.DailyStats {
+	if summary.Daily == nil {
+		return runtime.DailyStats{Total: summary.Total, Success: summary.Success, Failure: summary.Failure}
+	}
+	now := time.Now()
+	switch rangeKey {
+	case "today":
+		return cloneDailyStats(summary.Daily[now.Format("2006-01-02")])
+	case "yesterday":
+		return cloneDailyStats(summary.Daily[now.AddDate(0, 0, -1).Format("2006-01-02")])
+	case "7d":
+		result := runtime.DailyStats{}
+		for index := 0; index < 7; index++ {
+			item := summary.Daily[now.AddDate(0, 0, -index).Format("2006-01-02")]
+			if item == nil {
+				continue
+			}
+			result.Total += item.Total
+			result.Success += item.Success
+			result.Failure += item.Failure
+		}
+		return result
+	default:
+		return runtime.DailyStats{Total: summary.Total, Success: summary.Success, Failure: summary.Failure}
+	}
+}
+
+func cloneDailyStats(item *runtime.DailyStats) runtime.DailyStats {
+	if item == nil {
+		return runtime.DailyStats{}
+	}
+	return runtime.DailyStats{
+		Total:   item.Total,
+		Success: item.Success,
+		Failure: item.Failure,
+	}
+}
+
+func parsePositiveIntQuery(r *http.Request, key string, fallback int) int {
+	raw := strings.TrimSpace(r.URL.Query().Get(key))
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 0 {
+		return fallback
+	}
+	return value
+}
+
+func filterDetailsByRange(details []runtime.DetailRecord, rangeKey string) []runtime.DetailRecord {
+	if rangeKey == "" {
+		return details
+	}
+	now := time.Now()
+	location := now.Location()
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, location)
+	yesterday := today.AddDate(0, 0, -1)
+	sevenDaysAgo := today.AddDate(0, 0, -6)
+	filtered := make([]runtime.DetailRecord, 0, len(details))
+	for _, detail := range details {
+		detailTime, err := time.Parse(time.RFC3339, detail.Timestamp)
+		if err != nil {
+			continue
+		}
+		localTime := detailTime.In(location)
+		keep := false
+		switch rangeKey {
+		case "today":
+			keep = !localTime.Before(today)
+		case "yesterday":
+			keep = !localTime.Before(yesterday) && localTime.Before(today)
+		case "7d":
+			keep = !localTime.Before(sevenDaysAgo)
+		default:
+			keep = true
+		}
+		if keep {
+			filtered = append(filtered, detail)
+		}
+	}
+	return filtered
 }
 
 func (d RouterDeps) fetchAdapterState(ctx context.Context) (map[string]any, error) {
@@ -503,6 +626,80 @@ func (d RouterDeps) handleTestPlatformAccountFetch(w http.ResponseWriter, r *htt
 	result, err := d.Tasks.TestPlatformAccountFetch(ctx, upstreamItem, accountItem)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (d RouterDeps) handleExternalFetchTask(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+		return
+	}
+	if !d.Runtime.SystemConfig().ExternalAPIEnabled {
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "external api disabled"})
+		return
+	}
+	var payload task.ExternalFetchRequest
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid fetch payload"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+	defer cancel()
+	if err := d.syncAllUpstreamsToAdapter(ctx); err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
+		return
+	}
+	result, err := d.Tasks.FetchExternalTask(ctx, payload)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (d RouterDeps) handleExternalURLTemplates(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+		return
+	}
+	if !d.Runtime.SystemConfig().ExternalAPIEnabled {
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "external api disabled"})
+		return
+	}
+	writeJSON(w, http.StatusOK, d.Tasks.ListExternalURLTemplates())
+}
+
+func (d RouterDeps) handleExternalSubmitTask(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+		return
+	}
+	if !d.Runtime.SystemConfig().ExternalAPIEnabled {
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": "external api disabled"})
+		return
+	}
+	var payload task.ExternalSubmitRequest
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid submit payload"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+	defer cancel()
+	result, err := d.Tasks.SubmitExternalTask(ctx, payload)
+	if err != nil {
+		status := http.StatusBadGateway
+		if strings.Contains(err.Error(), "不能为空") || strings.Contains(err.Error(), "不属于该 worker") || strings.Contains(err.Error(), "仅支持") || strings.Contains(err.Error(), "未找到对应的外部任务认领记录") || strings.Contains(err.Error(), "解析第") {
+			status = http.StatusBadRequest
+		}
+		writeJSON(w, status, map[string]any{
+			"error":        err.Error(),
+			"task_id":      result.TaskID,
+			"detail_ids":   result.DetailIDs,
+			"capture_urls": result.CaptureURLs,
+			"device_id":    result.DeviceID,
+		})
 		return
 	}
 	writeJSON(w, http.StatusOK, result)

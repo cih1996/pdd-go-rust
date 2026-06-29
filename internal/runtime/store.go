@@ -9,10 +9,10 @@ import (
 )
 
 const (
-	eventLimit       = 200
-	detailLimit      = 200
-	adapterLogLimit  = 200
-	pendingTaskLimit = 200
+	eventLimit       = 500
+	detailLimit      = 2000
+	adapterLogLimit  = 500
+	pendingTaskLimit = 500
 )
 
 type URLTemplateRecord struct {
@@ -28,6 +28,7 @@ type SystemConfig struct {
 	OpenURLDelaySeconds   float64             `json:"open_url_delay_seconds"`
 	ClickImageDelaySecond float64             `json:"click_image_delay_seconds"`
 	MaxTaskSKUCount       int                 `json:"max_task_sku_count"`
+	ExternalAPIEnabled    bool                `json:"external_api_enabled"`
 	UseURLTemplates       bool                `json:"use_url_templates"`
 	URLTemplates          []URLTemplateRecord `json:"url_templates"`
 }
@@ -105,10 +106,17 @@ type AdapterSubmitLogRecord struct {
 	Error           string `json:"error,omitempty"`
 }
 
-type Summary struct {
+type DailyStats struct {
 	Total   int `json:"total"`
 	Success int `json:"success"`
 	Failure int `json:"failure"`
+}
+
+type Summary struct {
+	Total   int                    `json:"total"`
+	Success int                    `json:"success"`
+	Failure int                    `json:"failure"`
+	Daily   map[string]*DailyStats `json:"daily"`
 }
 
 type PersistedData struct {
@@ -162,6 +170,36 @@ func NewStore(backend Backend) *Store {
 			store.systemConfig = data.SystemConfig
 		}
 	}
+	if store.summary.Daily == nil {
+		store.summary.Daily = make(map[string]*DailyStats)
+	}
+
+	// 尝试从本地已存的 details 中恢复因升级丢失的每日统计
+	recoveredDaily := make(map[string]*DailyStats)
+	for _, d := range store.details {
+		dateStr := d.Timestamp
+		if len(dateStr) >= 10 {
+			dateStr = dateStr[:10]
+		} else {
+			continue
+		}
+		if recoveredDaily[dateStr] == nil {
+			recoveredDaily[dateStr] = &DailyStats{}
+		}
+		recoveredDaily[dateStr].Total++
+		switch d.Status {
+		case "success":
+			recoveredDaily[dateStr].Success++
+		case "failure", "cancelled", "account_risk":
+			recoveredDaily[dateStr].Failure++
+		}
+	}
+	for dateStr, rec := range recoveredDaily {
+		if existing, ok := store.summary.Daily[dateStr]; !ok || existing.Total < rec.Total {
+			store.summary.Daily[dateStr] = rec
+		}
+	}
+
 	return store
 }
 
@@ -169,6 +207,26 @@ func (s *Store) Snapshot() (Summary, []EventRecord, []DetailRecord, []PendingTas
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.summary, cloneEvents(s.eventLog), cloneDetails(s.details), clonePending(s.pendingTasks), cloneAdapterLogs(s.adapterSubmitLog), s.systemConfig
+}
+
+func (s *Store) Summary() Summary {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return cloneSummary(s.summary)
+}
+
+func (s *Store) Details() []DetailRecord {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return cloneDetails(s.details)
+}
+
+func (s *Store) ClearDetails() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.details = []DetailRecord{}
+	s.summary = Summary{Daily: make(map[string]*DailyStats)}
+	s.persistLocked()
 }
 
 func (s *Store) SystemConfig() SystemConfig {
@@ -252,12 +310,31 @@ func (s *Store) AddDetail(record DetailRecord) DetailRecord {
 	if len(s.details) > detailLimit {
 		s.details = s.details[:detailLimit]
 	}
+	if s.summary.Daily == nil {
+		s.summary.Daily = make(map[string]*DailyStats)
+	}
+	dateStr := record.Timestamp
+	if len(dateStr) >= 10 {
+		dateStr = dateStr[:10]
+	} else {
+		dateStr = time.Now().UTC().Format("2006-01-02")
+	}
+
+	daily, ok := s.summary.Daily[dateStr]
+	if !ok {
+		daily = &DailyStats{}
+		s.summary.Daily[dateStr] = daily
+	}
+
 	s.summary.Total++
+	daily.Total++
 	switch record.Status {
 	case "success":
 		s.summary.Success++
+		daily.Success++
 	case "failure", "cancelled", "account_risk":
 		s.summary.Failure++
+		daily.Failure++
 	}
 	s.persistLocked()
 	return record
@@ -381,6 +458,22 @@ func cloneSystemConfig(value SystemConfig) SystemConfig {
 	if len(value.URLTemplates) > 0 {
 		result.URLTemplates = make([]URLTemplateRecord, len(value.URLTemplates))
 		copy(result.URLTemplates, value.URLTemplates)
+	}
+	return result
+}
+
+func cloneSummary(value Summary) Summary {
+	result := value
+	if value.Daily != nil {
+		result.Daily = make(map[string]*DailyStats, len(value.Daily))
+		for key, item := range value.Daily {
+			if item == nil {
+				result.Daily[key] = nil
+				continue
+			}
+			copyItem := *item
+			result.Daily[key] = &copyItem
+		}
 	}
 	return result
 }

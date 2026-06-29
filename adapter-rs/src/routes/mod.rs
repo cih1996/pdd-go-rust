@@ -6,6 +6,9 @@ use axum::{
     Json, Router,
 };
 use serde_json::{json, Value};
+use std::error::Error as _;
+use std::time::Duration;
+use tokio::time::sleep;
 use url::Url;
 
 use crate::models::{
@@ -16,6 +19,7 @@ use crate::models::{
 use crate::state::AppState;
 
 const LAOQIAN_DEFAULT_ORIGIN: &str = "https://frontend.yqlaoqian111.com";
+const LAOQIAN_UPLOAD_RETRY_DELAYS_MS: &[u64] = &[800, 1500];
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -177,7 +181,7 @@ async fn submit_task(
     State(state): State<AppState>,
     Json(payload): Json<ClientSubmitRequest>,
 ) -> Response {
-    let Some(context) = state.take_issued_task(&payload.task_id) else {
+    let Some(mut context) = state.take_issued_task(&payload.task_id) else {
         return error_response(StatusCode::BAD_REQUEST, "未找到对应的上游任务上下文");
     };
 
@@ -195,7 +199,7 @@ async fn submit_task(
             submit_to_mock_http(&state, &upstream, &context, &payload).await
         }
         UpstreamType::LaoqianWorker => {
-            submit_to_laoqian_http(&state, &upstream, &context, &payload).await
+            submit_to_laoqian_http(&state, &upstream, &mut context, &payload).await
         }
     };
 
@@ -354,7 +358,7 @@ async fn fetch_from_mock_http(
         .json(&json!({}))
         .send()
         .await
-        .map_err(|err| format!("请求本地模拟上游失败: {err}"))?;
+        .map_err(|err| format_reqwest_error("请求本地模拟上游失败", &err))?;
 
     if response.status() == StatusCode::NO_CONTENT {
         return Ok(None);
@@ -377,41 +381,9 @@ async fn fetch_from_laoqian_http(
     raw_token: &str,
 ) -> Result<Option<(ClientTask, IssuedTaskContext)>, String> {
     let (account, secret_key, explicit_upload_token) = parse_laoqian_token(raw_token)?;
+    let session_token = login_laoqian(state, upstream, &account, &secret_key).await?;
     let origin = laoqian_origin(upstream);
-    let login_url = format!("{}/api/user/login", upstream.base_url.trim_end_matches('/'));
     let client = upstream_http_client(state, upstream)?;
-    let login_response = client
-        .post(login_url)
-        .header(reqwest::header::ORIGIN, origin.as_str())
-        .json(&json!({"account": account, "secret_key": secret_key}))
-        .send()
-        .await
-        .map_err(|err| format!("老钱登录失败: {err}"))?;
-    if !login_response.status().is_success() {
-        let text = login_response.text().await.unwrap_or_default();
-        return Err(format!("老钱登录失败: {text}"));
-    }
-    let login_payload: Value = login_response
-        .json()
-        .await
-        .map_err(|err| format!("老钱登录响应解析失败: {err}"))?;
-    if !laoqian_business_success(&login_payload) {
-        return Err(format!(
-            "老钱登录失败: {}",
-            laoqian_message(&login_payload).unwrap_or_else(|| login_payload.to_string())
-        ));
-    }
-    let session_token = login_payload
-        .get("token")
-        .and_then(|item| item.as_str())
-        .filter(|item| !item.trim().is_empty())
-        .ok_or_else(|| {
-            format!(
-                "老钱登录响应缺少 token: {}",
-                laoqian_message(&login_payload).unwrap_or_else(|| login_payload.to_string())
-            )
-        })?
-        .to_string();
 
     let fetch_url = upstream_url(upstream, upstream.fetch_path.as_deref())
         .ok_or_else(|| "老钱上游缺少 fetch_path".to_string())?;
@@ -423,19 +395,27 @@ async fn fetch_from_laoqian_http(
             .json(&json!({"item_type": "ds_detail"}))
             .send()
             .await
-            .map_err(|err| format!("老钱获取任务失败: {err}"))?;
+            .map_err(|err| format_reqwest_error("老钱获取任务失败", &err))?;
 
-        if fetch_response.status() == StatusCode::NO_CONTENT {
+        let fetch_status = fetch_response.status();
+        if fetch_status == StatusCode::NO_CONTENT {
             return Ok(None);
         }
-        if !fetch_response.status().is_success() {
+        if !fetch_status.is_success() {
             let text = fetch_response.text().await.unwrap_or_default();
             return Err(format!("老钱获取任务失败: {text}"));
         }
 
         let raw_payload = fetch_response.text().await.unwrap_or_default();
+        println!(
+            "[老钱][fetch-task] source_code={} status={} raw={}",
+            upstream.code,
+            fetch_status,
+            raw_payload
+        );
         let payload: Value = serde_json::from_str(&raw_payload)
             .map_err(|err| format!("老钱获取任务响应解析失败: {err}; raw={raw_payload}"))?;
+
         if !laoqian_business_success(&payload) {
             let message = laoqian_message(&payload).unwrap_or_else(|| raw_payload.clone());
             if is_laoqian_no_task_message(&message) {
@@ -456,6 +436,8 @@ async fn fetch_from_laoqian_http(
             upstream,
             payload,
             &raw_payload,
+            &account,
+            &secret_key,
             session_token.clone(),
             explicit_upload_token.clone(),
         )? {
@@ -518,7 +500,7 @@ async fn submit_to_mock_http(
         .json(&request_payload)
         .send()
         .await
-        .map_err(|err| format!("提交本地模拟上游失败: {err}"))?;
+        .map_err(|err| format_reqwest_error("提交本地模拟上游失败", &err))?;
     let status = response.status();
     let body = parse_response_value(response).await;
     if !status.is_success() {
@@ -530,14 +512,14 @@ async fn submit_to_mock_http(
 async fn submit_to_laoqian_http(
     state: &AppState,
     upstream: &UpstreamConfig,
-    context: &IssuedTaskContext,
+    context: &mut IssuedTaskContext,
     payload: &ClientSubmitRequest,
 ) -> Result<Value, String> {
     let item_id = context
         .item_id
         .clone()
         .ok_or_else(|| "老钱任务缺少 item_id".to_string())?;
-    let session = context
+    let mut session = context
         .laoqian_session_token
         .clone()
         .ok_or_else(|| "老钱任务缺少登录会话".to_string())?;
@@ -590,20 +572,53 @@ async fn submit_to_laoqian_http(
         })
     };
 
-    let client = upstream_http_client(state, upstream)?;
-    let response = client
-        .post(url)
-        .header(reqwest::header::ORIGIN, origin.as_str())
-        .header(reqwest::header::COOKIE, format!("token={session}"))
-        .json(&request_payload)
-        .send()
-        .await
-        .map_err(|err| format!("提交老钱上游失败: {err}"))?;
-    let status = response.status();
-    let body = parse_response_value(response).await;
-    if !status.is_success() {
-        return Err(format!("提交老钱上游失败: {body}"));
-    }
+    // Uploading captures may refresh the session token; always use the latest one.
+    session = context
+        .laoqian_session_token
+        .clone()
+        .unwrap_or(session);
+
+    let submit_result = send_laoqian_submit_request(
+        state,
+        upstream,
+        origin.as_str(),
+        url.as_str(),
+        &session,
+        &request_payload,
+    )
+    .await;
+    let body = match submit_result {
+        Ok(payload) => payload,
+        Err((status, payload)) if should_retry_laoqian_upload_after_relogin(status, &payload) => {
+            refresh_laoqian_session_token(state, upstream, context).await?;
+            session = context
+                .laoqian_session_token
+                .clone()
+                .ok_or_else(|| "老钱自动重登后缺少 session_token".to_string())?;
+            match send_laoqian_submit_request(
+                state,
+                upstream,
+                origin.as_str(),
+                url.as_str(),
+                &session,
+                &request_payload,
+            )
+            .await
+            {
+                Ok(payload) => payload,
+                Err((retry_status, retry_payload)) => {
+                    return Err(format_laoqian_submit_error(
+                        retry_status,
+                        &retry_payload,
+                        is_success_submit,
+                    ));
+                }
+            }
+        }
+        Err((status, payload)) => {
+            return Err(format_laoqian_submit_error(status, &payload, is_success_submit));
+        }
+    };
     if !is_success_submit && should_block_goods_on_failure(payload) {
         if let Some(goods_id) = context.goods_id.as_deref() {
             state.block_laoqian_goods(goods_id, "命中失败释放，已自动拉黑");
@@ -656,6 +671,8 @@ fn build_mock_task_from_payload(
                     .map(|value| vec![value.to_string()])
             })
             .unwrap_or_default(),
+        laoqian_account: None,
+        laoqian_secret_key: None,
         laoqian_session_token: None,
         laoqian_upload_token: None,
     };
@@ -676,6 +693,8 @@ fn build_laoqian_task_from_payload(
     upstream: &UpstreamConfig,
     payload: Value,
     raw_payload: &str,
+    account: &str,
+    secret_key: &str,
     session_token: String,
     explicit_upload_token: Option<String>,
 ) -> Result<LaoqianFetchDecision, String> {
@@ -749,6 +768,7 @@ fn build_laoqian_task_from_payload(
             reason: "goods_id 已领取过，按规则直接释放".to_string(),
         });
     }
+    let goods_name = string_field(content.get("spu_name")).unwrap_or_default();
     let mut task_items = Vec::new();
     if let Some(skus) = content.get("skus").and_then(|value| value.as_array()) {
         for (index, item) in skus.iter().enumerate() {
@@ -761,14 +781,28 @@ fn build_laoqian_task_from_payload(
             if sku_id.is_empty() || goods_id.is_empty() {
                 continue;
             }
+            let mut sku_label = Vec::new();
+            if let Some(props) = item.get("sku_props").and_then(|value| value.as_array()) {
+                for prop in props {
+                    if let Some(value) = prop.get("v_custom").and_then(|value| value.as_str()) {
+                        let value = value.trim();
+                        if !value.is_empty() {
+                            sku_label.push(value.to_string());
+                        }
+                    }
+                }
+            }
             task_items.push(ClientTaskItem {
                 goods_id: goods_id.clone(),
+                goods_name: Some(goods_name.clone()),
                 sku_id,
+                sku_name: sku_label,
                 source_url: source_urls.get(index).cloned(),
                 step_index: index as i32,
             });
         }
     }
+
     if task_items.is_empty() {
         return Ok(LaoqianFetchDecision::Drop {
             item_id,
@@ -801,6 +835,8 @@ fn build_laoqian_task_from_payload(
         goods_id: Some(goods_id),
         share_url,
         source_urls,
+        laoqian_account: Some(account.to_string()),
+        laoqian_secret_key: Some(secret_key.to_string()),
         laoqian_session_token: Some(session_token),
         laoqian_upload_token: explicit_upload_token,
     };
@@ -815,7 +851,20 @@ fn extract_task_items_from_value(payload: &Value) -> Vec<ClientTaskItem> {
             .filter_map(|(index, item)| {
                 Some(ClientTaskItem {
                     goods_id: item.get("goods_id")?.as_str()?.trim().to_string(),
+                    goods_name: string_field(item.get("goods_name")),
                     sku_id: item.get("sku_id")?.as_str()?.trim().to_string(),
+                    sku_name: item
+                        .get("sku_name")
+                        .and_then(|value| value.as_array())
+                        .map(|values| {
+                            values
+                                .iter()
+                                .filter_map(|value| value.as_str())
+                                .map(|value| value.trim().to_string())
+                                .filter(|value| !value.is_empty())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default(),
                     source_url: string_field(item.get("source_url"))
                         .or_else(|| string_field(item.get("url"))),
                     step_index: item
@@ -838,7 +887,9 @@ fn extract_task_items_from_value(payload: &Value) -> Vec<ClientTaskItem> {
     if !goods_id.is_empty() {
         return vec![ClientTaskItem {
             goods_id: goods_id.clone(),
+            goods_name: None,
             sku_id: if sku_id.is_empty() { goods_id } else { sku_id },
+            sku_name: Vec::new(),
             source_url: url_value.clone(),
             step_index: 0,
         }];
@@ -908,7 +959,20 @@ fn extract_mock_task_items_from_source(raw: &str, depth: usize) -> Vec<ClientTas
                 }
                 items.push(ClientTaskItem {
                     goods_id,
+                    goods_name: string_field(item.get("goods_name")),
                     sku_id,
+                    sku_name: item
+                        .get("sku_name")
+                        .and_then(|value| value.as_array())
+                        .map(|values| {
+                            values
+                                .iter()
+                                .filter_map(|value| value.as_str())
+                                .map(|value| value.trim().to_string())
+                                .filter(|value| !value.is_empty())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default(),
                     source_url: string_field(item.get("source_url"))
                         .or_else(|| string_field(item.get("url")))
                         .map(|value| normalize_raw_link(&value)),
@@ -938,7 +1002,9 @@ fn extract_mock_task_items_from_source(raw: &str, depth: usize) -> Vec<ClientTas
     if !goods_id.is_empty() {
         return vec![ClientTaskItem {
             goods_id: goods_id.clone(),
+            goods_name: None,
             sku_id: if sku_id.is_empty() { goods_id } else { sku_id },
+            sku_name: Vec::new(),
             source_url: Some(normalized.to_string()),
             step_index: 0,
         }];
@@ -1052,24 +1118,19 @@ async fn drop_laoqian_item(
     item_id: &str,
 ) -> Result<Value, String> {
     let origin = laoqian_origin(upstream);
-    let client = upstream_http_client(state, upstream)?;
-    let response = client
-        .post(format!(
+    send_laoqian_submit_request(
+        state,
+        upstream,
+        origin.as_str(),
+        &format!(
             "{}/api/item/drop",
             upstream.base_url.trim_end_matches('/')
-        ))
-        .header(reqwest::header::ORIGIN, origin.as_str())
-        .header(reqwest::header::COOKIE, format!("token={session}"))
-        .json(&json!({ "item_id": item_id.parse::<i64>().unwrap_or_default() }))
-        .send()
-        .await
-        .map_err(|err| format!("释放老钱任务失败: {err}"))?;
-    let status = response.status();
-    let body = parse_response_value(response).await;
-    if !status.is_success() {
-        return Err(format!("释放老钱任务失败: {body}"));
-    }
-    Ok(body)
+        ),
+        session,
+        &json!({ "item_id": item_id.parse::<i64>().unwrap_or_default() }),
+    )
+    .await
+    .map_err(|(status, payload)| format_laoqian_submit_error(status, &payload, false))
 }
 
 async fn check_laoqian_link_goods_id(
@@ -1080,27 +1141,45 @@ async fn check_laoqian_link_goods_id(
     share_url: &str,
 ) -> Result<Value, String> {
     let origin = laoqian_origin(upstream);
-    let client = upstream_http_client(state, upstream)?;
-    let response = client
-        .post(format!(
+    send_laoqian_submit_request(
+        state,
+        upstream,
+        origin.as_str(),
+        &format!(
             "{}/api/item/check_link_goods_id",
             upstream.base_url.trim_end_matches('/')
-        ))
-        .header(reqwest::header::ORIGIN, origin.as_str())
-        .header(reqwest::header::COOKIE, format!("token={session}"))
-        .json(&json!({
+        ),
+        session,
+        &json!({
             "item_id": item_id.parse::<i64>().unwrap_or_default(),
             "share_url": share_url,
-        }))
-        .send()
-        .await
-        .map_err(|err| format!("老钱链接校验请求失败: {err}"))?;
-    let status = response.status();
-    let body = parse_response_value(response).await;
-    if !status.is_success() {
-        return Err(format!("老钱链接校验失败: {body}"));
-    }
-    Ok(body)
+        }),
+    )
+    .await
+    .map_err(|(status, payload)| {
+        let fallback = payload.to_string();
+        let message = laoqian_message(&payload).unwrap_or(fallback.clone());
+        if !status.is_success() {
+            format!(
+                "老钱链接校验失败: HTTP {}: {}",
+                status.as_u16(),
+                if message.trim().is_empty() {
+                    fallback
+                } else {
+                    message
+                }
+            )
+        } else {
+            format!(
+                "老钱链接校验失败: {}",
+                if message.trim().is_empty() {
+                    fallback
+                } else {
+                    message
+                }
+            )
+        }
+    })
 }
 
 fn should_block_goods_on_failure(payload: &ClientSubmitRequest) -> bool {
@@ -1186,6 +1265,197 @@ fn laoqian_message(payload: &Value) -> Option<String> {
         .filter(|item| !item.is_empty())
 }
 
+fn should_retry_laoqian_upload_after_relogin(status: StatusCode, payload: &Value) -> bool {
+    status == StatusCode::UNAUTHORIZED || laoqian_message(payload).as_deref() == Some("请登录")
+}
+
+fn should_retry_laoqian_upload_after_delay(
+    status: StatusCode,
+    payload: &Value,
+    raw_payload: &str,
+) -> bool {
+    if status != StatusCode::BAD_GATEWAY {
+        return false;
+    }
+    let mut candidates = Vec::with_capacity(2);
+    if let Some(message) = laoqian_message(payload) {
+        candidates.push(message.to_lowercase());
+    }
+    let raw = raw_payload.trim();
+    if !raw.is_empty() {
+        candidates.push(raw.to_lowercase());
+    }
+    candidates.iter().any(|item| {
+        item.contains("error sending request")
+            || item.contains("connection error")
+            || item.contains("sendrequest")
+            || item.contains("os error 10054")
+            || item.contains("远程主机强迫关闭了一个现有的连接")
+            || item.contains("connection reset")
+            || item.contains("timed out")
+    })
+}
+
+fn format_laoqian_upload_error(status: StatusCode, payload: &Value, raw_payload: &str) -> String {
+    if !status.is_success() {
+        let message = laoqian_message(payload).unwrap_or_else(|| raw_payload.to_string());
+        return format!(
+            "上传老钱截图失败: HTTP {}: {}",
+            status.as_u16(),
+            if message.trim().is_empty() {
+                raw_payload.to_string()
+            } else {
+                message
+            }
+        );
+    }
+    if !laoqian_business_success(payload) {
+        let message = laoqian_message(payload).unwrap_or_else(|| raw_payload.to_string());
+        return format!(
+            "上传老钱截图失败: {}",
+            if message.trim().is_empty() {
+                raw_payload.to_string()
+            } else {
+                message
+            }
+        );
+    }
+    format!("老钱上传响应缺少 path; raw={raw_payload}")
+}
+
+fn format_laoqian_submit_error(status: StatusCode, payload: &Value, is_success_submit: bool) -> String {
+    let action = if is_success_submit { "提交老钱上游失败" } else { "释放老钱上游失败" };
+    let fallback = payload.to_string();
+    if !status.is_success() {
+        let message = laoqian_message(payload).unwrap_or_else(|| fallback.clone());
+        return format!(
+            "{}: HTTP {}: {}",
+            action,
+            status.as_u16(),
+            if message.trim().is_empty() {
+                fallback
+            } else {
+                message
+            }
+        );
+    }
+    let message = laoqian_message(payload).unwrap_or(fallback.clone());
+    format!(
+        "{}: {}",
+        action,
+        if message.trim().is_empty() {
+            fallback
+        } else {
+            message
+        }
+    )
+}
+
+async fn send_laoqian_submit_request(
+    state: &AppState,
+    upstream: &UpstreamConfig,
+    origin: &str,
+    url: &str,
+    session: &str,
+    request_payload: &Value,
+) -> Result<Value, (StatusCode, Value)> {
+    let client =
+        upstream_http_client(state, upstream).map_err(|err| (StatusCode::BAD_GATEWAY, Value::String(err)))?;
+    let response = client
+        .post(url)
+        .header(reqwest::header::ORIGIN, origin)
+        .header(reqwest::header::COOKIE, format!("token={session}"))
+        .json(request_payload)
+        .send()
+        .await
+        .map_err(|err| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Value::String(format_reqwest_error("提交老钱上游失败", &err)),
+            )
+        })?;
+    let status = response.status();
+    let body = parse_response_value(response).await;
+    if !status.is_success() || !laoqian_business_success(&body) {
+        return Err((status, body));
+    }
+    Ok(body)
+}
+
+async fn login_laoqian(
+    state: &AppState,
+    upstream: &UpstreamConfig,
+    account: &str,
+    secret_key: &str,
+) -> Result<String, String> {
+    let origin = laoqian_origin(upstream);
+    let login_url = format!("{}/api/user/login", upstream.base_url.trim_end_matches('/'));
+    let client = upstream_http_client(state, upstream)?;
+    let login_response = client
+        .post(login_url)
+        .header(reqwest::header::ORIGIN, origin.as_str())
+        .json(&json!({"account": account, "secret_key": secret_key}))
+        .send()
+        .await
+        .map_err(|err| format_reqwest_error("老钱登录失败", &err))?;
+    let status = login_response.status();
+    let raw_payload = login_response.text().await.unwrap_or_default();
+    let payload: Value = serde_json::from_str(&raw_payload).unwrap_or_else(|_| {
+        if raw_payload.trim().is_empty() {
+            Value::Null
+        } else {
+            Value::String(raw_payload.clone())
+        }
+    });
+    if !status.is_success() {
+        let message = laoqian_message(&payload).unwrap_or_else(|| raw_payload.clone());
+        return Err(format!(
+            "老钱登录失败: HTTP {}: {}",
+            status.as_u16(),
+            if message.trim().is_empty() {
+                raw_payload
+            } else {
+                message
+            }
+        ));
+    }
+    if !laoqian_business_success(&payload) {
+        return Err(format!(
+            "老钱登录失败: {}",
+            laoqian_message(&payload).unwrap_or_else(|| raw_payload.clone())
+        ));
+    }
+    payload
+        .get("token")
+        .and_then(|item| item.as_str())
+        .filter(|item| !item.trim().is_empty())
+        .map(|item| item.to_string())
+        .ok_or_else(|| {
+            format!(
+                "老钱登录响应缺少 token: {}",
+                laoqian_message(&payload).unwrap_or_else(|| raw_payload)
+            )
+        })
+}
+
+async fn refresh_laoqian_session_token(
+    state: &AppState,
+    upstream: &UpstreamConfig,
+    context: &mut IssuedTaskContext,
+) -> Result<(), String> {
+    let account = context
+        .laoqian_account
+        .as_deref()
+        .ok_or_else(|| "老钱任务缺少登录账号，无法自动重登".to_string())?;
+    let secret_key = context
+        .laoqian_secret_key
+        .as_deref()
+        .ok_or_else(|| "老钱任务缺少登录密钥，无法自动重登".to_string())?;
+    let session_token = login_laoqian(state, upstream, account, secret_key).await?;
+    context.laoqian_session_token = Some(session_token);
+    Ok(())
+}
+
 fn is_laoqian_no_task_message(message: &str) -> bool {
     let value = message.trim();
     value.contains("暂时没有题可做了")
@@ -1219,9 +1489,14 @@ fn guess_content_type(file_name: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_laoqian_task_from_payload, extract_mock_task_items_from_url};
+    use super::{
+        build_laoqian_task_from_payload, extract_mock_task_items_from_url,
+        format_laoqian_submit_error, should_retry_laoqian_upload_after_delay,
+        should_retry_laoqian_upload_after_relogin,
+    };
     use crate::models::UpstreamType;
     use crate::state::AppState;
+    use axum::http::StatusCode;
     use serde_json::json;
 
     #[test]
@@ -1256,6 +1531,8 @@ mod tests {
             &upstream,
             payload,
             &raw_payload,
+            "demo-account",
+            "demo-secret",
             "session-token".to_string(),
             None,
         )
@@ -1274,12 +1551,72 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn retry_laoqian_upload_after_relogin_only_for_documented_signals() {
+        assert!(should_retry_laoqian_upload_after_relogin(
+            StatusCode::UNAUTHORIZED,
+            &json!({"message": "其他错误"})
+        ));
+        assert!(should_retry_laoqian_upload_after_relogin(
+            StatusCode::OK,
+            &json!({"message": "请登录"})
+        ));
+        assert!(!should_retry_laoqian_upload_after_relogin(
+            StatusCode::OK,
+            &json!({"message": "token 已过期"})
+        ));
+    }
+
+    #[test]
+    fn retry_laoqian_upload_after_delay_only_for_transport_failures() {
+        assert!(should_retry_laoqian_upload_after_delay(
+            StatusCode::BAD_GATEWAY,
+            &json!("上传老钱截图失败: error sending request | caused by: connection error"),
+            "上传老钱截图失败: error sending request | caused by: connection error"
+        ));
+        assert!(should_retry_laoqian_upload_after_delay(
+            StatusCode::BAD_GATEWAY,
+            &json!("远程主机强迫关闭了一个现有的连接。 (os error 10054)"),
+            "远程主机强迫关闭了一个现有的连接。 (os error 10054)"
+        ));
+        assert!(!should_retry_laoqian_upload_after_delay(
+            StatusCode::OK,
+            &json!({"message": "请登录"}),
+            r#"{"message":"请登录"}"#
+        ));
+        assert!(!should_retry_laoqian_upload_after_delay(
+            StatusCode::BAD_GATEWAY,
+            &json!("老钱题目已失效"),
+            "老钱题目已失效"
+        ));
+    }
+
+    #[test]
+    fn format_laoqian_submit_error_requires_business_success() {
+        assert_eq!(
+            format_laoqian_submit_error(
+                StatusCode::OK,
+                &json!({"status": 500, "message": "无当前题目作业权限，请重新领题"}),
+                true
+            ),
+            "提交老钱上游失败: 无当前题目作业权限，请重新领题"
+        );
+        assert_eq!(
+            format_laoqian_submit_error(
+                StatusCode::BAD_REQUEST,
+                &json!({"message": "参数错误"}),
+                false
+            ),
+            "释放老钱上游失败: HTTP 400: 参数错误"
+        );
+    }
 }
 
 async fn build_laoqian_capture_fields(
     state: &AppState,
     upstream: &UpstreamConfig,
-    context: &IssuedTaskContext,
+    context: &mut IssuedTaskContext,
     item: &ClientSubmitTaskItem,
 ) -> Result<(Vec<String>, Vec<String>), String> {
     let mut uploaded = Vec::new();
@@ -1311,19 +1648,112 @@ async fn build_laoqian_capture_fields(
 async fn upload_laoqian_capture(
     state: &AppState,
     upstream: &UpstreamConfig,
-    context: &IssuedTaskContext,
+    context: &mut IssuedTaskContext,
     path: &std::path::Path,
     file_name: &str,
 ) -> Result<String, String> {
-    let Some(item_id) = context.item_id.as_deref() else {
-        return Err("老钱任务缺少 item_id".to_string());
-    };
-    let token = context
+    let first_attempt_token = context
         .laoqian_upload_token
         .clone()
         .or_else(|| context.laoqian_session_token.clone())
         .ok_or_else(|| "老钱任务缺少上传 token".to_string())?;
-    let bytes = std::fs::read(path).map_err(|err| format!("读取本地截图失败: {err}"))?;
+    match send_laoqian_capture_upload_with_retry(
+        state,
+        upstream,
+        context,
+        path,
+        file_name,
+        &first_attempt_token,
+    )
+    .await
+    {
+        Ok(uploaded_path) => Ok(uploaded_path),
+        Err((status, payload, raw_payload)) => {
+            if should_retry_laoqian_upload_after_relogin(status, &payload) {
+                refresh_laoqian_session_token(state, upstream, context).await?;
+                let retry_token = context
+                    .laoqian_session_token
+                    .clone()
+                    .ok_or_else(|| "老钱自动重登后缺少 session_token".to_string())?;
+                match send_laoqian_capture_upload_with_retry(
+                    state,
+                    upstream,
+                    context,
+                    path,
+                    file_name,
+                    &retry_token,
+                )
+                .await
+                {
+                    Ok(uploaded_path) => Ok(uploaded_path),
+                    Err((retry_status, retry_payload, retry_raw_payload)) => {
+                        Err(format_laoqian_upload_error(retry_status, &retry_payload, &retry_raw_payload))
+                    }
+                }
+            } else {
+                Err(format_laoqian_upload_error(status, &payload, &raw_payload))
+            }
+        }
+    }
+}
+
+async fn send_laoqian_capture_upload_with_retry(
+    state: &AppState,
+    upstream: &UpstreamConfig,
+    context: &IssuedTaskContext,
+    path: &std::path::Path,
+    file_name: &str,
+    upload_token: &str,
+) -> Result<String, (StatusCode, Value, String)> {
+    let mut last_error = None;
+    for (attempt, delay_ms) in std::iter::once(0)
+        .chain((1..=LAOQIAN_UPLOAD_RETRY_DELAYS_MS.len()).map(|index| index as u64))
+        .zip(std::iter::once(0).chain(LAOQIAN_UPLOAD_RETRY_DELAYS_MS.iter().copied()))
+    {
+        if delay_ms > 0 {
+            sleep(Duration::from_millis(delay_ms)).await;
+        }
+        match send_laoqian_capture_upload(state, upstream, context, path, file_name, upload_token).await {
+            Ok(uploaded_path) => return Ok(uploaded_path),
+            Err((status, payload, raw_payload)) => {
+                let should_retry = should_retry_laoqian_upload_after_delay(status, &payload, &raw_payload);
+                if should_retry && (attempt as usize) < LAOQIAN_UPLOAD_RETRY_DELAYS_MS.len() {
+                    last_error = Some((status, payload, raw_payload));
+                    continue;
+                }
+                return Err((status, payload, raw_payload));
+            }
+        }
+    }
+    Err(last_error.unwrap_or((
+        StatusCode::BAD_GATEWAY,
+        Value::String("老钱上传重试失败".to_string()),
+        "老钱上传重试失败".to_string(),
+    )))
+}
+
+async fn send_laoqian_capture_upload(
+    state: &AppState,
+    upstream: &UpstreamConfig,
+    context: &IssuedTaskContext,
+    path: &std::path::Path,
+    file_name: &str,
+    upload_token: &str,
+) -> Result<String, (StatusCode, Value, String)> {
+    let Some(item_id) = context.item_id.as_deref() else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Value::String("老钱任务缺少 item_id".to_string()),
+            "老钱任务缺少 item_id".to_string(),
+        ));
+    };
+    let bytes = std::fs::read(path).map_err(|err| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Value::String(format!("读取本地截图失败: {err}")),
+            format!("读取本地截图失败: {err}"),
+        )
+    })?;
     let form = reqwest::multipart::Form::new()
         .part(
             "file",
@@ -1332,27 +1762,41 @@ async fn upload_laoqian_capture(
         .text("file_name", file_name.to_string())
         .text("file_size", bytes.len().to_string())
         .text("item_id", format!("tw/{item_id}"))
-        .text("token", token);
-    let client = upstream_http_client(state, upstream)?;
+        .text("token", upload_token.to_string());
+    let client = upstream_http_client(state, upstream).map_err(|message| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Value::String(message.clone()),
+            message,
+        )
+    })?;
     let response = client
         .put("https://file.yqlaoqian111.com/upload")
         .header(reqwest::header::ORIGIN, LAOQIAN_DEFAULT_ORIGIN)
         .multipart(form)
         .send()
         .await
-        .map_err(|err| format!("上传老钱截图失败: {err}"))?;
-    if !response.status().is_success() {
-        return Err(format!("上传老钱截图失败: {}", response.status()));
+        .map_err(|err| {
+            let message = format_reqwest_error("上传老钱截图失败", &err);
+            (StatusCode::BAD_GATEWAY, Value::String(message.clone()), message)
+        })?;
+    let status = response.status();
+    let raw_payload = response.text().await.unwrap_or_default();
+    let payload: Value = serde_json::from_str(&raw_payload).unwrap_or_else(|_| {
+        if raw_payload.trim().is_empty() {
+            Value::Null
+        } else {
+            Value::String(raw_payload.clone())
+        }
+    });
+    if !status.is_success() || !laoqian_business_success(&payload) {
+        return Err((status, payload, raw_payload));
     }
-    let payload: Value = response
-        .json()
-        .await
-        .map_err(|err| format!("解析老钱上传响应失败: {err}"))?;
     payload
         .get("path")
         .and_then(|value| value.as_str())
         .map(|value| value.to_string())
-        .ok_or_else(|| "老钱上传响应缺少 path".to_string())
+        .ok_or_else(|| (status, payload, raw_payload))
 }
 
 fn upstream_http_client(state: &AppState, upstream: &UpstreamConfig) -> Result<reqwest::Client, String> {
@@ -1371,4 +1815,17 @@ fn upstream_http_client(state: &AppState, upstream: &UpstreamConfig) -> Result<r
         .proxy(proxy)
         .build()
         .map_err(|err| format!("创建上游代理客户端失败: {err}"))
+}
+
+fn format_reqwest_error(prefix: &str, err: &reqwest::Error) -> String {
+    let mut parts = vec![err.to_string()];
+    let mut current = err.source();
+    while let Some(source) = current {
+        let message = source.to_string();
+        if !message.is_empty() && !parts.iter().any(|item| item == &message) {
+            parts.push(message);
+        }
+        current = source.source();
+    }
+    format!("{prefix}: {}", parts.join(" | caused by: "))
 }

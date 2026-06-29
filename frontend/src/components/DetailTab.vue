@@ -7,18 +7,24 @@ import { formatApiDateTime } from '../utils/datetime'
 
 const props = defineProps<{
   summary: DashboardSummary
+  detailSummary: DashboardSummary
   details: DetailRecord[]
+  detailTotal: number
+  detailLoading: boolean
+  detailHasMore: boolean
   rangeKey: string
   clearing: boolean
 }>()
 
 const emit = defineEmits<{
   (event: 'update:rangeKey', value: string): void
+  (event: 'load-more'): void
   (event: 'clear-details'): void
 }>()
 
 const searchDevice = ref('')
 const searchKeyword = ref('')
+const LOAD_MORE_THRESHOLD = 80
 
 function toTaskH5Url(url?: string | null): string {
   const raw = url?.trim()
@@ -53,32 +59,88 @@ function openTaskUrl(url?: string | null) {
   window.open(target, '_blank', 'noopener')
 }
 
-function submitStatusTagType(status?: number | null) {
-  if (!status) return 'info'
-  if (status >= 500) return 'danger'
-  if (status >= 400) return 'warning'
-  return 'success'
+function isDateInRange(timestamp: string, rangeKey: string): boolean {
+  const date = new Date(timestamp)
+  const now = new Date()
+  
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+  const yesterday = new Date(today)
+  yesterday.setDate(yesterday.getDate() - 1)
+  const sevenDaysAgo = new Date(today)
+  sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 6)
+
+  if (rangeKey === 'today') {
+    return date >= today
+  } else if (rangeKey === 'yesterday') {
+    return date >= yesterday && date < today
+  } else if (rangeKey === '7d') {
+    return date >= sevenDaysAgo
+  }
+  return true
 }
 
-function formatSubmitStatus(status?: number | null): string {
-  if (!status) return '--'
-  return `HTTP ${status}`
-}
+const detailsInRange = computed(() => {
+  return props.details.filter(d => isDateInRange(d.timestamp, props.rangeKey))
+})
 
-function formatSubmitError(detail: DetailRecord): string {
-  const parts: string[] = []
-  if (detail.submit_status_code) {
-    parts.push(`状态码: HTTP ${detail.submit_status_code}`)
+const rangeSummary = computed(() => {
+  if (props.detailSummary.total || props.detailSummary.success || props.detailSummary.failure) {
+    return props.detailSummary
   }
-  if (detail.submit_error?.trim()) {
-    parts.push(`原始错误: ${detail.submit_error.trim()}`)
+  if (props.summary.daily) {
+    const today = new Date()
+    
+    if (props.rangeKey === 'today') {
+      const todayStr = today.toISOString().slice(0, 10)
+      const daily = props.summary.daily[todayStr] || { total: 0, success: 0, failure: 0 }
+      return daily
+    }
+    
+    if (props.rangeKey === 'yesterday') {
+      const yesterday = new Date(today)
+      yesterday.setDate(yesterday.getDate() - 1)
+      const yesterdayStr = yesterday.toISOString().slice(0, 10)
+      const daily = props.summary.daily[yesterdayStr] || { total: 0, success: 0, failure: 0 }
+      return daily
+    }
+
+    if (props.rangeKey === '7d') {
+      let t = 0, s = 0, f = 0
+      for (let i = 0; i < 7; i++) {
+        const d = new Date(today)
+        d.setDate(d.getDate() - i)
+        const dateStr = d.toISOString().slice(0, 10)
+        const daily = props.summary.daily[dateStr]
+        if (daily) {
+          t += daily.total
+          s += daily.success
+          f += daily.failure
+        }
+      }
+      return { total: t, success: s, failure: f }
+    }
   }
-  return parts.join('\n')
-}
+
+  // Fallback if daily is not available from backend
+  let total = 0
+  let success = 0
+  let failure = 0
+  
+  for (const d of detailsInRange.value) {
+    total++
+    if (d.status === 'success') {
+      success++
+    } else if (d.status === 'failure' || d.status === 'cancelled' || d.recognition === 'account_risk') {
+      failure++
+    }
+  }
+  
+  return { total, success, failure }
+})
 
 const filteredDetails = computed(() => {
   const keyword = searchKeyword.value.trim()
-  return props.details.filter((d) => {
+  return detailsInRange.value.filter((d) => {
     const matchDevice = searchDevice.value ? d.device_id.includes(searchDevice.value) : true
     const matchTask = keyword
       ? [
@@ -96,6 +158,17 @@ const filteredDetails = computed(() => {
     return matchDevice && matchTask
   })
 })
+
+function handleDetailScroll(event: Event) {
+  const target = event.target as HTMLElement | null
+  if (!target || props.detailLoading || !props.detailHasMore) {
+    return
+  }
+  const remaining = target.scrollHeight - target.scrollTop - target.clientHeight
+  if (remaining <= LOAD_MORE_THRESHOLD) {
+    emit('load-more')
+  }
+}
 </script>
 
 <template>
@@ -108,7 +181,7 @@ const filteredDetails = computed(() => {
             <div class="stat-icon">📊</div>
             <div class="stat-content">
               <div class="stat-label">总任务数</div>
-              <div class="stat-value">{{ summary.total }}</div>
+              <div class="stat-value">{{ rangeSummary.total }}</div>
             </div>
           </div>
         </el-col>
@@ -117,7 +190,7 @@ const filteredDetails = computed(() => {
             <div class="stat-icon">✅</div>
             <div class="stat-content">
               <div class="stat-label">成功任务</div>
-              <div class="stat-value text-green">{{ summary.success }}</div>
+              <div class="stat-value text-green">{{ rangeSummary.success }}</div>
             </div>
           </div>
         </el-col>
@@ -126,7 +199,7 @@ const filteredDetails = computed(() => {
             <div class="stat-icon">❌</div>
             <div class="stat-content">
               <div class="stat-label">失败任务</div>
-              <div class="stat-value text-red">{{ summary.failure }}</div>
+              <div class="stat-value text-red">{{ rangeSummary.failure }}</div>
             </div>
           </div>
         </el-col>
@@ -149,7 +222,12 @@ const filteredDetails = computed(() => {
         <div class="flex-between detail-header">
           <div class="header-left">
             <span class="card-title">执行明细与日志</span>
-            <el-tag type="info" effect="light" round class="ml-3">当前显示 {{ filteredDetails.length }} 条</el-tag>
+            <el-tag type="info" effect="light" round class="ml-3">
+              已加载 {{ details.length }} / {{ detailTotal }} 条
+            </el-tag>
+            <el-tag v-if="searchDevice || searchKeyword" type="warning" effect="light" round class="ml-3">
+              当前筛选命中 {{ filteredDetails.length }} 条
+            </el-tag>
           </div>
           
           <div class="header-right">
@@ -174,8 +252,9 @@ const filteredDetails = computed(() => {
         </div>
       </template>
 
-      <el-table :data="filteredDetails" style="width: 100%" class="modern-table">
-        <el-table-column label="执行时间" width="180">
+      <div class="detail-table-scroll" @scroll="handleDetailScroll">
+        <el-table :data="filteredDetails" style="width: 100%" class="modern-table">
+          <el-table-column label="执行时间" width="180">
           <template #default="{ row }">
             <div class="time-cell">
               <span class="date">{{ formatApiDateTime(row.timestamp).split(' ')[0] }}</span>
@@ -237,7 +316,7 @@ const filteredDetails = computed(() => {
           </template>
         </el-table-column>
         
-        <el-table-column label="详情信息" min-width="320">
+        <el-table-column label="详情信息" min-width="220">
           <template #default="{ row }">
             <div class="detail-info-cell">
               <div v-if="row.recognition" class="recognition-text" title="识别内容">
@@ -246,37 +325,11 @@ const filteredDetails = computed(() => {
               <div class="message-text" :class="{'is-error': row.status === 'failure'}" :title="row.message">
                 {{ row.message || '-' }}
               </div>
-              <div
-                v-if="row.submit_status_code || row.submit_error"
-                class="submit-error-box"
-                :title="formatSubmitError(row)"
-              >
-                <div class="submit-error-title">提交错误</div>
-                <div class="submit-error-body">{{ formatSubmitError(row) }}</div>
-              </div>
             </div>
           </template>
         </el-table-column>
 
-        <el-table-column label="提交状态" width="120" align="center">
-          <template #default="{ row }">
-            <el-tag v-if="row.submit_status_code" :type="submitStatusTagType(row.submit_status_code)" effect="dark">
-              {{ formatSubmitStatus(row.submit_status_code) }}
-            </el-tag>
-            <span v-else class="text-gray text-xs">--</span>
-          </template>
-        </el-table-column>
 
-        <el-table-column label="提交原始错误" min-width="340">
-          <template #default="{ row }">
-            <div
-              v-if="row.submit_error"
-              class="submit-error-raw"
-              :title="row.submit_error"
-            >{{ row.submit_error }}</div>
-            <span v-else class="text-gray text-xs">--</span>
-          </template>
-        </el-table-column>
         
         <el-table-column label="任务截图" width="220" align="center">
           <template #default="{ row }">
@@ -297,8 +350,14 @@ const filteredDetails = computed(() => {
             </div>
             <span v-else class="text-gray text-xs">暂无截图</span>
           </template>
-        </el-table-column>
-      </el-table>
+          </el-table-column>
+        </el-table>
+        <div class="detail-load-state">
+          <span v-if="detailLoading" class="text-gray text-xs">明细加载中...</span>
+          <span v-else-if="detailHasMore" class="text-gray text-xs">滑动到底部自动加载更多</span>
+          <span v-else class="text-gray text-xs">已加载完当前时间范围内的明细</span>
+        </div>
+      </div>
     </el-card>
   </div>
 </template>
@@ -412,6 +471,15 @@ const filteredDetails = computed(() => {
   border-radius: 8px;
   overflow: hidden;
 }
+.detail-table-scroll {
+  max-height: 72vh;
+  overflow-y: auto;
+}
+.detail-load-state {
+  display: flex;
+  justify-content: center;
+  padding: 12px 0 4px;
+}
 .modern-table :deep(th.el-table__cell) {
   background-color: #f8fafc;
   color: #475569;
@@ -515,34 +583,7 @@ const filteredDetails = computed(() => {
 .message-text.is-error {
   color: #ef4444;
 }
-.submit-error-box {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 8px 10px;
-  border-radius: 8px;
-  background: #fef2f2;
-  border: 1px solid #fecaca;
-}
-.submit-error-title {
-  font-size: 12px;
-  font-weight: 600;
-  color: #b91c1c;
-}
-.submit-error-body {
-  font-size: 12px;
-  line-height: 1.5;
-  color: #991b1b;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-.submit-error-raw {
-  font-size: 12px;
-  line-height: 1.5;
-  color: #991b1b;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
+
 
 .capture-gallery {
   display: flex;

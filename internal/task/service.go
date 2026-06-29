@@ -3,6 +3,7 @@ package task
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +27,12 @@ import (
 	"unified-server/internal/ws"
 )
 
+const (
+	externalClaimTimeout  = 120 * time.Second
+	externalBufferTimeout = 3 * time.Minute
+	groupTaskTimeout      = 3 * time.Minute
+)
+
 type Service struct {
 	cfg      config.Config
 	hub      *ws.Hub
@@ -40,11 +47,17 @@ type Service struct {
 	mu               sync.Mutex
 	workers          map[string]context.CancelFunc
 	prefetchCancel   context.CancelFunc
+	externalSweepRun bool
 	candidateCursor  int
 	noCandidateWarn  bool
 	pending          []pendingTask
 	active           map[string]runningTask
 	groups           map[string]*groupedTask
+	externalBuffered map[string]externalBufferedTask
+	externalBufferQ  []string
+	externalClaims   map[string]externalClaim
+	externalBusiness map[string]string
+	externalSources  map[string]string
 	urlTemplateState map[string]deviceURLTemplateState
 }
 
@@ -58,10 +71,12 @@ type stopRequest struct {
 }
 
 type clientTaskItem struct {
-	GoodsID   string `json:"goods_id"`
-	SKUID     string `json:"sku_id"`
-	SourceURL string `json:"source_url"`
-	StepIndex int    `json:"step_index"`
+	GoodsID   string   `json:"goods_id"`
+	GoodsName string   `json:"goods_name,omitempty"`
+	SKUName   []string `json:"sku_name,omitempty"`
+	SKUID     string   `json:"sku_id"`
+	SourceURL string   `json:"source_url"`
+	StepIndex int      `json:"step_index"`
 }
 
 type clientTask struct {
@@ -186,8 +201,110 @@ type PlatformAccountTestResult struct {
 	Message         string `json:"message"`
 }
 
+type ExternalFetchRequest struct {
+	WorkerID   string `json:"worker_id"`
+	WorkerName string `json:"worker_name"`
+	SourceCode string `json:"source_code"`
+}
+
+type ExternalTaskItem struct {
+	GoodsID   string   `json:"goods_id"`
+	GoodsName string   `json:"goods_name,omitempty"`
+	SKUName   []string `json:"sku_name,omitempty"`
+	SKUID     string   `json:"sku_id"`
+	SourceURL string   `json:"source_url"`
+	StepIndex int      `json:"step_index"`
+}
+
+type ExternalTask struct {
+	TaskID          string             `json:"task_id"`
+	UpstreamTaskRef string             `json:"upstream_task_ref"`
+	SourceCode      string             `json:"source_code"`
+	SourceName      string             `json:"source_name"`
+	AccountID       string             `json:"account_id,omitempty"`
+	AccountName     string             `json:"account_name,omitempty"`
+	TaskItems       []ExternalTaskItem `json:"task_items"`
+}
+
+type ExternalFetchResponse struct {
+	Success bool          `json:"success"`
+	HasTask bool          `json:"has_task"`
+	Message string        `json:"message"`
+	Task    *ExternalTask `json:"task"`
+}
+
+type ExternalURLTemplate struct {
+	ID           string `json:"id"`
+	Name         string `json:"name,omitempty"`
+	Template     string `json:"template"`
+	TriggerCount int    `json:"trigger_count"`
+	SuccessCount int    `json:"success_count"`
+	RiskCount    int    `json:"risk_count"`
+}
+
+type ExternalURLTemplatesResponse struct {
+	Success         bool                  `json:"success"`
+	UseURLTemplates bool                  `json:"use_url_templates"`
+	Templates       []ExternalURLTemplate `json:"templates"`
+}
+
+type ExternalSubmitCapture struct {
+	ContentBase64 string `json:"content_base64"`
+	ContentType   string `json:"content_type,omitempty"`
+}
+
+type ExternalSubmitTaskItem struct {
+	GoodsID     string                  `json:"goods_id,omitempty"`
+	SKUID       string                  `json:"sku_id,omitempty"`
+	Recognition string                  `json:"recognition,omitempty"`
+	Message     string                  `json:"message,omitempty"`
+	Captures    []ExternalSubmitCapture `json:"captures,omitempty"`
+}
+
+type ExternalSubmitRequest struct {
+	TaskID     string                   `json:"task_id"`
+	WorkerID   string                   `json:"worker_id"`
+	DeviceID   string                   `json:"device_id,omitempty"`
+	TemplateID string                   `json:"template_id,omitempty"`
+	Result     string                   `json:"result"`
+	Message    string                   `json:"message,omitempty"`
+	TaskItems  []ExternalSubmitTaskItem `json:"task_items"`
+}
+
+type ExternalSubmitResponse struct {
+	Success     bool     `json:"success"`
+	Message     string   `json:"message"`
+	TaskID      string   `json:"task_id"`
+	DeviceID    string   `json:"device_id"`
+	DetailIDs   []string `json:"detail_ids,omitempty"`
+	CaptureURLs []string `json:"capture_urls,omitempty"`
+}
+
+type externalClaim struct {
+	Task        clientTask
+	Source      sourceCandidate
+	BusinessKey string
+	WorkerID    string
+	WorkerName  string
+	ClaimedAt   string
+}
+
+type externalBufferedTask struct {
+	Task         clientTask
+	Source       sourceCandidate
+	BusinessKey  string
+	PrefetchedAt string
+}
+
+type externalFetchCandidateResult struct {
+	Index     int
+	Candidate sourceCandidate
+	Task      *clientTask
+	Err       error
+}
+
 func NewService(cfg config.Config, hub *ws.Hub, tpl *template.Store, visionEngine *vision.Engine, devices *device.Service, ups *upstream.Store, accounts *account.Store, runtimeStore *rt.Store) *Service {
-	return &Service{
+	service := &Service{
 		cfg:              cfg,
 		hub:              hub,
 		tpl:              tpl,
@@ -200,19 +317,395 @@ func NewService(cfg config.Config, hub *ws.Hub, tpl *template.Store, visionEngin
 		workers:          map[string]context.CancelFunc{},
 		active:           map[string]runningTask{},
 		groups:           map[string]*groupedTask{},
+		externalBuffered: map[string]externalBufferedTask{},
+		externalBufferQ:  []string{},
+		externalClaims:   map[string]externalClaim{},
+		externalBusiness: map[string]string{},
+		externalSources:  map[string]string{},
 		urlTemplateState: map[string]deviceURLTemplateState{},
 	}
+	service.ensureExternalClaimSweeper()
+	return service
 }
 
 func (s *Service) RuntimePlan() map[string]any {
 	return map[string]any{
-		"adapter_mode":   "standalone rust service",
-		"ws_push":        true,
-		"vision":         s.vision.Plan(),
-		"template_total": s.tpl.Count(),
-		"device_total":   len(s.devices.List()),
-		"worker_total":   s.workerCount(),
+		"adapter_mode":                   "standalone rust service",
+		"ws_push":                        true,
+		"vision":                         s.vision.Plan(),
+		"template_total":                 s.tpl.Count(),
+		"device_total":                   len(s.devices.List()),
+		"worker_total":                   s.workerCount(),
+		"external_claim_timeout_seconds": int(externalClaimTimeout / time.Second),
 	}
+}
+
+func (s *Service) ensureExternalClaimSweeper() {
+	s.mu.Lock()
+	if s.externalSweepRun {
+		s.mu.Unlock()
+		return
+	}
+	s.externalSweepRun = true
+	s.mu.Unlock()
+
+	go s.externalClaimSweepLoop()
+}
+
+func (s *Service) externalClaimSweepLoop() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		s.releaseExpiredExternalClaims()
+	}
+}
+
+func (s *Service) releaseExpiredExternalClaims() {
+	now := time.Now().UTC()
+	expired := make([]externalClaim, 0)
+
+	s.mu.Lock()
+	for _, claim := range s.externalClaims {
+		claimedAt, err := time.Parse(time.RFC3339, claim.ClaimedAt)
+		if err != nil {
+			claimedAt = now.Add(-externalClaimTimeout - time.Second)
+		}
+		if now.Sub(claimedAt) >= externalClaimTimeout {
+			expired = append(expired, claim)
+		}
+	}
+	s.mu.Unlock()
+
+	for _, claim := range expired {
+		s.releaseExpiredExternalClaim(claim)
+	}
+}
+
+func (s *Service) releaseExpiredExternalClaim(claim externalClaim) {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	message := fmt.Sprintf("外部设备超时 %d 秒未提交，系统自动释放", int(externalClaimTimeout/time.Second))
+	err := s.submitTaskWithMessage(ctx, externalDeviceID(claim.WorkerID, ""), claim.Task, "cancelled", nil, message)
+	if err != nil {
+		s.emitEvent("warning", "外部任务超时自动释放失败", externalDeviceID(claim.WorkerID, ""), map[string]any{
+			"worker_id":         claim.WorkerID,
+			"worker_name":       claim.WorkerName,
+			"task_id":           claim.Task.TaskID,
+			"upstream_task_ref": claim.Task.UpstreamTaskRef,
+			"source_code":       claim.Task.SourceCode,
+			"error":             err.Error(),
+		})
+		return
+	}
+
+	s.releaseExternalClaim(claim.Task.TaskID)
+	detail := s.buildDetail(
+		claim.Task,
+		nil,
+		externalDeviceID(claim.WorkerID, ""),
+		"external",
+		"",
+		"cancelled",
+		"external_timeout_release",
+		nil,
+		"",
+		message,
+		nil,
+	)
+	stored := s.runtime.AddDetail(detail)
+	s.hub.Broadcast(ws.Event{Type: "detail", Data: map[string]any(detailToMap(stored))})
+	s.emitEvent("warning", "外部任务超时自动释放", externalDeviceID(claim.WorkerID, ""), map[string]any{
+		"worker_id":         claim.WorkerID,
+		"worker_name":       claim.WorkerName,
+		"task_id":           claim.Task.TaskID,
+		"upstream_task_ref": claim.Task.UpstreamTaskRef,
+		"source_code":       claim.Task.SourceCode,
+		"timeout_seconds":   int(externalClaimTimeout / time.Second),
+	})
+	s.emitState()
+}
+
+func (s *Service) releaseExpiredExternalBufferedTask(buffered externalBufferedTask) {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	message := fmt.Sprintf("外部接口缓存任务超过 %d 秒未领取，系统自动释放", int(externalBufferTimeout/time.Second))
+	err := s.submitTaskWithMessage(ctx, "", buffered.Task, "cancelled", nil, message)
+	if err != nil {
+		s.emitEvent("warning", "外部缓存任务自动释放失败", "", map[string]any{
+			"task_id":           buffered.Task.TaskID,
+			"upstream_task_ref": buffered.Task.UpstreamTaskRef,
+			"source_code":       buffered.Task.SourceCode,
+			"error":             err.Error(),
+		})
+		return
+	}
+
+	s.releaseExternalBuffered(buffered.Task.TaskID)
+	s.emitEvent("warning", "外部缓存任务已自动释放", "", map[string]any{
+		"task_id":           buffered.Task.TaskID,
+		"upstream_task_ref": buffered.Task.UpstreamTaskRef,
+		"source_code":       buffered.Task.SourceCode,
+		"timeout_seconds":   int(externalBufferTimeout / time.Second),
+	})
+}
+
+func (s *Service) FetchExternalTask(ctx context.Context, req ExternalFetchRequest) (ExternalFetchResponse, error) {
+	workerID := strings.TrimSpace(req.WorkerID)
+	workerName := strings.TrimSpace(req.WorkerName)
+	sourceCode := strings.TrimSpace(req.SourceCode)
+	if workerID == "" {
+		return ExternalFetchResponse{}, errors.New("worker_id 不能为空")
+	}
+
+	candidates := s.fetchCandidatesBySource(sourceCode)
+	if len(candidates) == 0 {
+		if sourceCode != "" {
+			return ExternalFetchResponse{}, fmt.Errorf("未找到可用的上游账号: %s", sourceCode)
+		}
+		return ExternalFetchResponse{}, errors.New("当前没有启用的上游账号")
+	}
+
+	var firstErr error
+	start := s.nextCandidateCursor(len(candidates))
+	for offset := 0; offset < len(candidates); offset++ {
+		candidateIndex := (start + offset) % len(candidates)
+		candidate := candidates[candidateIndex]
+		if s.externalSourceLocked(candidate.Key) || s.sourceLocked(candidate.Key) {
+			continue
+		}
+
+		taskItem, err := s.fetchTaskForCandidateWithOptions(ctx, candidate, true)
+		s.setCandidateCursor((candidateIndex + 1) % len(candidates))
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			s.emitEvent("warning", "外部接口轮询取任务失败", "", map[string]any{
+				"source_key":   candidate.Key,
+				"source_code":  candidate.Upstream.Code,
+				"worker_id":    workerID,
+				"worker_name":  workerName,
+				"account_id":   accountIDOfCandidate(candidate),
+				"account_name": accountNameOfCandidate(candidate),
+				"error":        err.Error(),
+			})
+			continue
+		}
+		if taskItem == nil {
+			continue
+		}
+		if taskItem.AccountID == "" && candidate.Account != nil {
+			taskItem.AccountID = candidate.Account.ID
+		}
+		if taskItem.AccountName == "" && candidate.Account != nil {
+			taskItem.AccountName = candidate.Account.Name
+		}
+		if !s.reserveExternalClaim(*taskItem, candidate, workerID, workerName) {
+			_ = s.submitTaskWithMessage(ctx, "", *taskItem, "cancelled", nil, "duplicate business key released by external fetch")
+			continue
+		}
+
+		s.emitEvent("info", "外部设备领取任务", externalDeviceID(workerID, ""), map[string]any{
+			"worker_id":         workerID,
+			"worker_name":       workerName,
+			"task_id":           taskItem.TaskID,
+			"upstream_task_ref": taskItem.UpstreamTaskRef,
+			"source_code":       taskItem.SourceCode,
+			"account_id":        accountIDOfCandidate(candidate),
+			"account_name":      accountNameOfCandidate(candidate),
+		})
+		return ExternalFetchResponse{
+			Success: true,
+			HasTask: true,
+			Message: "ok",
+			Task:    buildExternalTaskPayload(*taskItem),
+		}, nil
+	}
+
+	if firstErr != nil {
+		return ExternalFetchResponse{}, firstErr
+	}
+	return ExternalFetchResponse{
+		Success: true,
+		HasTask: false,
+		Message: "当前暂无可领取任务",
+		Task:    nil,
+	}, nil
+}
+
+func (s *Service) ListExternalURLTemplates() ExternalURLTemplatesResponse {
+	cfg := s.runtime.SystemConfig()
+	items := configuredURLTemplates(cfg)
+	templates := make([]ExternalURLTemplate, 0, len(items))
+	for _, item := range items {
+		templates = append(templates, ExternalURLTemplate{
+			ID:           item.ID,
+			Name:         strings.TrimSpace(item.Name),
+			Template:     item.Template,
+			TriggerCount: item.TriggerCount,
+			SuccessCount: item.SuccessCount,
+			RiskCount:    item.RiskCount,
+		})
+	}
+	return ExternalURLTemplatesResponse{
+		Success:         true,
+		UseURLTemplates: cfg.UseURLTemplates,
+		Templates:       templates,
+	}
+}
+
+func (s *Service) SubmitExternalTask(ctx context.Context, req ExternalSubmitRequest) (ExternalSubmitResponse, error) {
+	taskID := strings.TrimSpace(req.TaskID)
+	workerID := strings.TrimSpace(req.WorkerID)
+	templateID := strings.TrimSpace(req.TemplateID)
+	if taskID == "" {
+		return ExternalSubmitResponse{}, errors.New("task_id 不能为空")
+	}
+	if workerID == "" {
+		return ExternalSubmitResponse{}, errors.New("worker_id 不能为空")
+	}
+
+	claim, ok := s.getExternalClaim(taskID)
+	if !ok {
+		return ExternalSubmitResponse{}, errors.New("未找到对应的外部任务认领记录")
+	}
+	if claim.WorkerID != workerID {
+		return ExternalSubmitResponse{}, errors.New("当前任务不属于该 worker")
+	}
+
+	submitType, detailStatus, err := normalizeExternalSubmitResult(req.Result)
+	if err != nil {
+		return ExternalSubmitResponse{}, err
+	}
+
+	deviceID := externalDeviceID(workerID, req.DeviceID)
+	systemConfig := s.runtime.SystemConfig()
+	templateRecord, templateFound := findURLTemplateByID(systemConfig, templateID)
+	templateMeta := urlTemplateMetaFromRecord(templateID, templateRecord, templateFound)
+	submitItems := make([]clientSubmitTaskItem, 0, len(req.TaskItems))
+	detailRecords := make([]rt.DetailRecord, 0, max(1, len(req.TaskItems)))
+	allCaptureURLs := make([]string, 0)
+	riskTriggered := false
+
+	if templateID != "" {
+		s.runtime.RecordURLTemplateTrigger(templateID)
+	}
+
+	for index, item := range req.TaskItems {
+		taskItem := matchExternalTaskItem(claim.Task, item, index)
+		if isExternalTemplateRiskItem(item) {
+			riskTriggered = true
+		}
+		captureIDs := make([]string, 0, len(item.Captures))
+		captureURLs := make([]string, 0, len(item.Captures))
+		for captureIndex, capture := range item.Captures {
+			data, contentType, err := decodeExternalCapture(capture)
+			if err != nil {
+				return ExternalSubmitResponse{}, fmt.Errorf("解析第 %d 张图片失败: %w", captureIndex+1, err)
+			}
+			fileName := buildExternalCaptureFileName(claim.Task.TaskID, taskItem, captureIndex, contentType)
+			uploaded, err := s.uploadCaptureNamed(ctx, claim.Task, deviceID, taskItem, data, fileName)
+			if err != nil {
+				return ExternalSubmitResponse{}, fmt.Errorf("上传第 %d 张图片失败: %w", captureIndex+1, err)
+			}
+			captureIDs = append(captureIDs, uploaded.CaptureID)
+			captureURLs = append(captureURLs, uploaded.CaptureURL)
+			allCaptureURLs = append(allCaptureURLs, uploaded.CaptureURL)
+		}
+
+		submitItems = append(submitItems, clientSubmitTaskItem{
+			GoodsID:     firstNonEmpty(strings.TrimSpace(item.GoodsID), taskItem.GoodsID),
+			SKUID:       firstNonEmpty(strings.TrimSpace(item.SKUID), taskItem.SKUID),
+			Recognition: strings.TrimSpace(item.Recognition),
+			Message:     strings.TrimSpace(item.Message),
+			CaptureIDs:  captureIDs,
+			CaptureURLs: captureURLs,
+		})
+
+		currentItem := taskItem
+		detailRecords = append(detailRecords, s.buildDetail(
+			claim.Task,
+			&currentItem,
+			deviceID,
+			"external",
+			resolveExternalDetailURL(taskItem, templateRecord, templateFound),
+			detailStatus,
+			firstNonEmpty(strings.TrimSpace(item.Recognition), submitType),
+			captureURLs,
+			"",
+			firstNonEmpty(strings.TrimSpace(item.Message), strings.TrimSpace(req.Message)),
+			templateMeta,
+		))
+	}
+
+	if len(detailRecords) == 0 {
+		detailRecords = append(detailRecords, s.buildDetail(
+			claim.Task,
+			nil,
+			deviceID,
+			"external",
+			resolveExternalFallbackURL(claim.Task, templateRecord, templateFound),
+			detailStatus,
+			submitType,
+			nil,
+			"",
+			strings.TrimSpace(req.Message),
+			templateMeta,
+		))
+	}
+
+	submitErr := s.submitTaskWithMessage(ctx, deviceID, claim.Task, submitType, submitItems, strings.TrimSpace(req.Message))
+	for index := range detailRecords {
+		if submitErr != nil {
+			detailRecords[index].Status = "failure"
+			detailRecords[index].SubmitStatusCode, detailRecords[index].SubmitError = parseAdapterSubmitFailure(submitErr)
+			detailRecords[index].Message = appendDetailMessage(detailRecords[index].Message, submitErr.Error())
+		}
+		stored := s.runtime.AddDetail(detailRecords[index])
+		detailRecords[index] = stored
+		s.hub.Broadcast(ws.Event{Type: "detail", Data: map[string]any(detailToMap(stored))})
+	}
+	s.emitState()
+
+	if submitErr != nil {
+		return ExternalSubmitResponse{
+			Success:     false,
+			Message:     submitErr.Error(),
+			TaskID:      claim.Task.TaskID,
+			DeviceID:    deviceID,
+			DetailIDs:   collectDetailIDs(detailRecords),
+			CaptureURLs: allCaptureURLs,
+		}, submitErr
+	}
+
+	if templateID != "" {
+		if riskTriggered {
+			s.runtime.RecordURLTemplateRisk(templateID)
+		} else if submitType == "success" {
+			s.runtime.RecordURLTemplateSuccess(templateID)
+		}
+	}
+
+	s.releaseExternalClaim(claim.Task.TaskID)
+	s.emitEvent(deviceID, "info", "外部设备提交任务", map[string]any{
+		"worker_id":         workerID,
+		"worker_name":       claim.WorkerName,
+		"task_id":           claim.Task.TaskID,
+		"upstream_task_ref": claim.Task.UpstreamTaskRef,
+		"source_code":       claim.Task.SourceCode,
+		"result":            submitType,
+	})
+
+	return ExternalSubmitResponse{
+		Success:     true,
+		Message:     "任务已提交",
+		TaskID:      claim.Task.TaskID,
+		DeviceID:    deviceID,
+		DetailIDs:   collectDetailIDs(detailRecords),
+		CaptureURLs: allCaptureURLs,
+	}, nil
 }
 
 func (s *Service) ResetDeviceURLTemplateState(deviceID string) {
@@ -369,6 +862,8 @@ func (s *Service) runWorker(ctx context.Context, deviceID string, mode string) {
 			if err := s.submitTaskWithMessage(ctx, deviceID, submission.Task, submission.SubmitType, submission.TaskItems, submission.Message); err != nil {
 				statusCode, submitError := parseAdapterSubmitFailure(err)
 				s.emitEvent("error", "提交任务失败", deviceID, map[string]any{"task_id": submission.Task.TaskID, "error": err.Error()})
+				detail.Status = "failure"
+				detail.Recognition = "submit_failed"
 				detail.SubmitStatusCode = statusCode
 				detail.SubmitError = submitError
 				detail.Message = strings.TrimSpace(detail.Message + "; submit failed: " + err.Error())
@@ -382,7 +877,7 @@ func (s *Service) runWorker(ctx context.Context, deviceID string, mode string) {
 					s.runtime.AddDetail(detail)
 					s.hub.Broadcast(ws.Event{Type: "detail", Data: map[string]any(detailToMap(detail))})
 					s.emitEvent("error", "老钱提交达到 IP 限额，当前设备已自动停止", deviceID, map[string]any{
-						"task_id":             submission.Task.TaskID,
+						"task_id":            submission.Task.TaskID,
 						"submit_status_code": detail.SubmitStatusCode,
 						"submit_error":       detail.SubmitError,
 					})
@@ -391,6 +886,9 @@ func (s *Service) runWorker(ctx context.Context, deviceID string, mode string) {
 				}
 			} else {
 				reportSuccess := submission.SubmitType == "success"
+				if reportSuccess && detail.TemplateID != "" {
+					s.runtime.RecordURLTemplateSuccess(detail.TemplateID)
+				}
 				if source.Account != nil {
 					s.accounts.RecordSubmit(source.Account.ID, reportSuccess)
 				}
@@ -435,7 +933,6 @@ func (s *Service) executeTask(ctx context.Context, deviceID string, mode string,
 	systemConfig := s.runtime.SystemConfig()
 	results := make([]skuExecutionResult, 0, len(taskItem.TaskItems))
 	clickTriggered := false
-	lastURLTemplateID := ""
 	lastURL := ""
 	adbCommands := make([]string, 0, len(taskItem.TaskItems))
 
@@ -443,9 +940,6 @@ func (s *Service) executeTask(ctx context.Context, deviceID string, mode string,
 		taskURLSelection := s.selectTaskURLForDevice(deviceID, systemConfig, item)
 		taskURL := taskURLSelection.URL
 		lastURL = taskURL
-		if taskURLSelection.TemplateID != "" {
-			lastURLTemplateID = taskURLSelection.TemplateID
-		}
 		s.devices.UpdateCurrentTask(deviceID, func(current *device.CurrentTask) {
 			current.TaskID = taskItem.TaskID
 			current.TaskMode = mode
@@ -505,9 +999,6 @@ func (s *Service) executeTask(ctx context.Context, deviceID string, mode string,
 	if clickTriggered {
 		message = "全部 SKU 识别完成，包含点击图链路"
 	}
-	if lastURLTemplateID != "" {
-		s.runtime.RecordURLTemplateSuccess(lastURLTemplateID)
-	}
 	var meta *matchedTemplateMeta
 	if len(results) > 0 {
 		meta = &matchedTemplateMeta{
@@ -533,6 +1024,9 @@ func (s *Service) submitTaskWithMessage(ctx context.Context, deviceID string, ta
 		default:
 			message = "任务失败"
 		}
+	}
+	if items == nil {
+		items = []clientSubmitTaskItem{}
 	}
 	requestPayload := clientSubmitRequest{
 		TaskID:    taskItem.TaskID,
@@ -587,9 +1081,13 @@ func (s *Service) submitTaskWithMessage(ctx context.Context, deviceID string, ta
 }
 
 func (s *Service) uploadCapture(ctx context.Context, taskItem clientTask, deviceID string, item clientTaskItem, capture []byte) (uploadCaptureResponse, error) {
+	return s.uploadCaptureNamed(ctx, taskItem, deviceID, item, capture, buildDefaultCaptureFileName(taskItem.TaskID, item, "png"))
+}
+
+func (s *Service) uploadCaptureNamed(ctx context.Context, taskItem clientTask, deviceID string, item clientTaskItem, capture []byte, fileName string) (uploadCaptureResponse, error) {
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
-	part, err := writer.CreateFormFile("file", filepath.Base(fmt.Sprintf("%s_%s.png", item.GoodsID, item.SKUID)))
+	part, err := writer.CreateFormFile("file", filepath.Base(strings.TrimSpace(fileName)))
 	if err != nil {
 		return uploadCaptureResponse{}, err
 	}
@@ -619,9 +1117,10 @@ func (s *Service) uploadCapture(ctx context.Context, taskItem clientTask, device
 		SourceCode:      taskItem.SourceCode,
 		DeviceID:        deviceID,
 		RequestPayload: map[string]any{
-			"goods_id": item.GoodsID,
-			"sku_id":   item.SKUID,
-			"size":     len(capture),
+			"goods_id":  item.GoodsID,
+			"sku_id":    item.SKUID,
+			"size":      len(capture),
+			"file_name": filepath.Base(strings.TrimSpace(fileName)),
 		},
 	}
 	if err != nil {
@@ -683,6 +1182,277 @@ func (s *Service) buildDetail(taskItem clientTask, currentItem *clientTaskItem, 
 		detail.RecognitionEngine = meta.RecognitionEngine
 	}
 	return detail
+}
+
+func buildExternalTaskPayload(task clientTask) *ExternalTask {
+	items := make([]ExternalTaskItem, 0, len(task.TaskItems))
+	for _, item := range task.TaskItems {
+		items = append(items, ExternalTaskItem{
+			GoodsID:   item.GoodsID,
+			GoodsName: item.GoodsName,
+			SKUName:   append([]string(nil), item.SKUName...),
+			SKUID:     item.SKUID,
+			SourceURL: item.SourceURL,
+			StepIndex: item.StepIndex,
+		})
+	}
+	return &ExternalTask{
+		TaskID:          task.TaskID,
+		UpstreamTaskRef: task.UpstreamTaskRef,
+		SourceCode:      task.SourceCode,
+		SourceName:      task.SourceName,
+		AccountID:       task.AccountID,
+		AccountName:     task.AccountName,
+		TaskItems:       items,
+	}
+}
+
+func findURLTemplateByID(cfg rt.SystemConfig, templateID string) (rt.URLTemplateRecord, bool) {
+	templateID = strings.TrimSpace(templateID)
+	if templateID == "" {
+		return rt.URLTemplateRecord{}, false
+	}
+	for _, item := range configuredURLTemplates(cfg) {
+		if item.ID == templateID {
+			return item, true
+		}
+	}
+	return rt.URLTemplateRecord{}, false
+}
+
+func urlTemplateMetaFromRecord(templateID string, record rt.URLTemplateRecord, found bool) *matchedTemplateMeta {
+	templateID = strings.TrimSpace(templateID)
+	if templateID == "" {
+		return nil
+	}
+	label := ""
+	if found {
+		label = strings.TrimSpace(record.Name)
+	}
+	return &matchedTemplateMeta{
+		TemplateID:    templateID,
+		TemplateLabel: label,
+	}
+}
+
+func resolveExternalDetailURL(item clientTaskItem, templateRecord rt.URLTemplateRecord, templateFound bool) string {
+	if templateFound && strings.TrimSpace(templateRecord.Template) != "" {
+		if rewritten := rewriteTemplateURL(templateRecord.Template, item.GoodsID, item.SKUID); strings.TrimSpace(rewritten) != "" {
+			return rewritten
+		}
+	}
+	return strings.TrimSpace(item.SourceURL)
+}
+
+func resolveExternalFallbackURL(task clientTask, templateRecord rt.URLTemplateRecord, templateFound bool) string {
+	if len(task.TaskItems) > 0 {
+		return resolveExternalDetailURL(task.TaskItems[0], templateRecord, templateFound)
+	}
+	if templateFound {
+		return strings.TrimSpace(templateRecord.Template)
+	}
+	return ""
+}
+
+func normalizeExternalSubmitResult(result string) (submitType string, detailStatus string, err error) {
+	switch strings.TrimSpace(strings.ToLower(result)) {
+	case "success":
+		return "success", "success", nil
+	case "failure":
+		return "failure", "failure", nil
+	case "cancelled":
+		return "cancelled", "cancelled", nil
+	default:
+		return "", "", errors.New("result 仅支持 success、failure、cancelled")
+	}
+}
+
+func isExternalTemplateRiskItem(item ExternalSubmitTaskItem) bool {
+	return strings.EqualFold(strings.TrimSpace(item.Recognition), "account_risk")
+}
+
+func matchExternalTaskItem(task clientTask, item ExternalSubmitTaskItem, index int) clientTaskItem {
+	goodsID := strings.TrimSpace(item.GoodsID)
+	skuID := strings.TrimSpace(item.SKUID)
+	for _, taskItem := range task.TaskItems {
+		if goodsID != "" && skuID != "" && taskItem.GoodsID == goodsID && taskItem.SKUID == skuID {
+			return taskItem
+		}
+		if skuID != "" && taskItem.SKUID == skuID {
+			return taskItem
+		}
+	}
+	if index >= 0 && index < len(task.TaskItems) {
+		return task.TaskItems[index]
+	}
+	return clientTaskItem{
+		GoodsID: goodsID,
+		SKUID:   skuID,
+	}
+}
+
+func decodeExternalCapture(capture ExternalSubmitCapture) ([]byte, string, error) {
+	raw := strings.TrimSpace(capture.ContentBase64)
+	contentType := strings.TrimSpace(capture.ContentType)
+	if raw == "" {
+		return nil, "", errors.New("content_base64 不能为空")
+	}
+	if strings.HasPrefix(raw, "data:") {
+		parts := strings.SplitN(raw, ",", 2)
+		if len(parts) != 2 {
+			return nil, "", errors.New("data url 格式无效")
+		}
+		if contentType == "" {
+			header := parts[0]
+			if strings.HasPrefix(header, "data:") {
+				contentType = strings.TrimPrefix(strings.SplitN(header, ";", 2)[0], "data:")
+			}
+		}
+		raw = parts[1]
+	}
+	data, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		data, err = base64.RawStdEncoding.DecodeString(raw)
+		if err != nil {
+			return nil, "", err
+		}
+	}
+	if contentType == "" {
+		contentType = http.DetectContentType(data)
+	}
+	return data, contentType, nil
+}
+
+func buildDefaultCaptureFileName(taskID string, item clientTaskItem, extension string) string {
+	ext := strings.TrimPrefix(strings.TrimSpace(extension), ".")
+	if ext == "" {
+		ext = "png"
+	}
+	return fmt.Sprintf("%s_%s_%s_%d.%s",
+		safeCaptureNamePart(taskID),
+		safeCaptureNamePart(item.GoodsID),
+		safeCaptureNamePart(item.SKUID),
+		time.Now().UnixNano(),
+		ext,
+	)
+}
+
+func buildExternalCaptureFileName(taskID string, item clientTaskItem, captureIndex int, contentType string) string {
+	fileName := buildDefaultCaptureFileName(taskID, item, contentTypeExtension(contentType, "png"))
+	if captureIndex <= 0 {
+		return fileName
+	}
+	ext := filepath.Ext(fileName)
+	base := strings.TrimSuffix(fileName, ext)
+	return fmt.Sprintf("%s_%d%s", base, captureIndex+1, ext)
+}
+
+func contentTypeExtension(contentType string, fallback string) string {
+	switch strings.ToLower(strings.TrimSpace(contentType)) {
+	case "image/jpeg", "image/jpg":
+		return "jpg"
+	case "image/webp":
+		return "webp"
+	case "image/gif":
+		return "gif"
+	case "image/bmp":
+		return "bmp"
+	case "image/png":
+		return "png"
+	default:
+		return fallback
+	}
+}
+
+func safeCaptureNamePart(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "capture"
+	}
+	var builder strings.Builder
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			builder.WriteRune(r)
+			continue
+		}
+		switch r {
+		case '-', '_':
+			builder.WriteRune(r)
+		default:
+			builder.WriteByte('_')
+		}
+	}
+	result := strings.Trim(builder.String(), "_")
+	if result == "" {
+		return "capture"
+	}
+	return result
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func appendDetailMessage(base string, suffix string) string {
+	base = strings.TrimSpace(base)
+	suffix = strings.TrimSpace(suffix)
+	switch {
+	case base == "":
+		return suffix
+	case suffix == "":
+		return base
+	default:
+		return base + "; submit failed: " + suffix
+	}
+}
+
+func collectDetailIDs(records []rt.DetailRecord) []string {
+	result := make([]string, 0, len(records))
+	for _, record := range records {
+		if record.ID != "" {
+			result = append(result, record.ID)
+		}
+	}
+	return result
+}
+
+func externalDeviceID(workerID string, deviceID string) string {
+	if strings.TrimSpace(deviceID) != "" {
+		return strings.TrimSpace(deviceID)
+	}
+	return "ext:" + strings.TrimSpace(workerID)
+}
+
+func accountIDOfCandidate(candidate sourceCandidate) string {
+	if candidate.Account == nil {
+		return ""
+	}
+	return candidate.Account.ID
+}
+
+func accountNameOfCandidate(candidate sourceCandidate) string {
+	if candidate.Account == nil {
+		return ""
+	}
+	return candidate.Account.Name
+}
+
+func removeTaskIDFromQueue(queue []string, taskID string) []string {
+	if len(queue) == 0 {
+		return queue
+	}
+	result := queue[:0]
+	for _, item := range queue {
+		if item != taskID {
+			result = append(result, item)
+		}
+	}
+	return result
 }
 
 func detailItemIDs(taskItem clientTask, currentItem *clientTaskItem) (string, string) {
@@ -796,13 +1566,12 @@ func (s *Service) emitEvent(level string, message string, deviceID string, paylo
 }
 
 func (s *Service) emitState() {
-	summary, events, details, pending, adapterLogs, systemConfig := s.runtime.Snapshot()
+	summary, events, _, pending, adapterLogs, systemConfig := s.runtime.Snapshot()
 	s.hub.Broadcast(ws.Event{
 		Type: "state",
 		Data: map[string]any{
 			"devices":             s.devices.List(),
 			"templates":           s.tpl.List(),
-			"details":             details,
 			"summary":             summary,
 			"event_log":           events,
 			"pending_tasks":       pending,
@@ -838,9 +1607,93 @@ func (s *Service) prefetchLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			s.releaseExpiredGroupedTasks(ctx)
 			s.fillPending(ctx)
 		}
 	}
+}
+
+type expiredGroupedTaskRelease struct {
+	TaskID          string
+	UpstreamTaskRef string
+	SourceCode      string
+	Source          sourceCandidate
+	Task            clientTask
+	PendingCount    int
+	ActiveCount     int
+	CompletedCount  int
+	Message         string
+}
+
+func (s *Service) releaseExpiredGroupedTasks(ctx context.Context) {
+	now := time.Now().UTC()
+	releases := make([]expiredGroupedTaskRelease, 0)
+
+	s.mu.Lock()
+	for parentKey, group := range s.groups {
+		// Only release tasks that are still sitting in the candidate queue and have
+		// never started execution. Once any child item is active or completed, the
+		// upstream task must stay claimed until the running worker finishes.
+		if len(group.Active) > 0 || len(group.Completed) > 0 {
+			continue
+		}
+		prefetchedAt, err := time.Parse(time.RFC3339, group.PrefetchedAt)
+		if err != nil {
+			prefetchedAt = now.Add(-groupTaskTimeout - time.Second)
+		}
+		if now.Sub(prefetchedAt) < groupTaskTimeout {
+			continue
+		}
+		message := fmt.Sprintf("任务进入候选区超过 %d 秒仍未开始执行，系统自动释放", int(groupTaskTimeout/time.Second))
+		releases = append(releases, expiredGroupedTaskRelease{
+			TaskID:          group.Task.TaskID,
+			UpstreamTaskRef: group.Task.UpstreamTaskRef,
+			SourceCode:      group.Task.SourceCode,
+			Source:          group.Source,
+			Task:            group.Task,
+			PendingCount:    len(group.Pending),
+			ActiveCount:     len(group.Active),
+			CompletedCount:  len(group.Completed),
+			Message:         message,
+		})
+		for childKey := range group.Pending {
+			s.pending = removePendingByChildKey(s.pending, childKey)
+		}
+		for childKey := range group.Active {
+			delete(s.active, childKey)
+		}
+		delete(s.groups, parentKey)
+	}
+	s.mu.Unlock()
+
+	if len(releases) == 0 {
+		return
+	}
+	for _, release := range releases {
+		s.runtime.RemovePendingTask(release.TaskID)
+		if err := s.submitTaskWithMessage(ctx, "", release.Task, "cancelled", nil, release.Message); err != nil {
+			s.emitEvent("error", "候选区超时自动释放失败", "", map[string]any{
+				"task_id":           release.TaskID,
+				"upstream_task_ref": release.UpstreamTaskRef,
+				"source_code":       release.SourceCode,
+				"pending_count":     release.PendingCount,
+				"active_count":      release.ActiveCount,
+				"completed_count":   release.CompletedCount,
+				"error":             err.Error(),
+			})
+			continue
+		}
+		s.emitEvent("warning", "候选区任务超时自动释放", "", map[string]any{
+			"task_id":           release.TaskID,
+			"upstream_task_ref": release.UpstreamTaskRef,
+			"source_code":       release.SourceCode,
+			"pending_count":     release.PendingCount,
+			"active_count":      release.ActiveCount,
+			"completed_count":   release.CompletedCount,
+			"timeout_seconds":   int(groupTaskTimeout / time.Second),
+		})
+	}
+	s.emitState()
 }
 
 func (s *Service) fillPending(ctx context.Context) {
@@ -938,6 +1791,55 @@ func (s *Service) fetchCandidates() []sourceCandidate {
 		}
 	}
 	return result
+}
+
+func (s *Service) fetchCandidatesBySource(sourceCode string) []sourceCandidate {
+	sourceCode = strings.TrimSpace(sourceCode)
+	if sourceCode == "" {
+		return s.fetchCandidates()
+	}
+	candidates := s.fetchCandidates()
+	result := make([]sourceCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.Upstream.Code == sourceCode {
+			result = append(result, candidate)
+		}
+	}
+	return result
+}
+
+func (s *Service) fetchExternalTasksConcurrently(ctx context.Context, candidates []sourceCandidate) []externalFetchCandidateResult {
+	start := s.nextCandidateCursor(len(candidates))
+	ordered := make([]sourceCandidate, 0, len(candidates))
+	for offset := 0; offset < len(candidates); offset++ {
+		candidate := candidates[(start+offset)%len(candidates)]
+		if s.externalSourceLocked(candidate.Key) || s.sourceLocked(candidate.Key) {
+			continue
+		}
+		ordered = append(ordered, candidate)
+	}
+	if len(ordered) == 0 {
+		return nil
+	}
+
+	results := make([]externalFetchCandidateResult, len(ordered))
+	var wg sync.WaitGroup
+	for index, candidate := range ordered {
+		wg.Add(1)
+		go func(index int, candidate sourceCandidate) {
+			defer wg.Done()
+			taskItem, err := s.fetchTaskForCandidateWithOptions(ctx, candidate, true)
+			results[index] = externalFetchCandidateResult{
+				Index:     index,
+				Candidate: candidate,
+				Task:      taskItem,
+				Err:       err,
+			}
+		}(index, candidate)
+	}
+	wg.Wait()
+	s.setCandidateCursor((start + len(ordered)) % len(candidates))
+	return results
 }
 
 func (s *Service) fetchTaskForCandidate(ctx context.Context, candidate sourceCandidate) (*clientTask, error) {
@@ -1126,6 +2028,23 @@ func (s *Service) pendingCount() int {
 func (s *Service) isSourceLocked(key string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.isSourceLockedLocked(key)
+}
+
+func (s *Service) sourceLocked(key string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.isSourceLockedLocked(key)
+}
+
+func (s *Service) externalSourceLocked(key string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.externalSources[key]
+	return ok
+}
+
+func (s *Service) isSourceLockedLocked(key string) bool {
 	for _, item := range s.pending {
 		if item.Source.Key == key {
 			return true
@@ -1136,14 +2055,121 @@ func (s *Service) isSourceLocked(key string) bool {
 			return true
 		}
 	}
+	if _, ok := s.externalSources[key]; ok {
+		return true
+	}
 	return false
 }
 
 func (s *Service) hasBusinessKey(key string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, ok := s.groups[key]
+	return s.hasBusinessKeyLocked(key)
+}
+
+func (s *Service) hasBusinessKeyLocked(key string) bool {
+	if _, ok := s.groups[key]; ok {
+		return true
+	}
+	_, ok := s.externalBusiness[key]
 	return ok
+}
+
+func (s *Service) reserveExternalBuffered(task clientTask, source sourceCandidate) bool {
+	businessKey := buildBusinessKey(task)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.hasBusinessKeyLocked(businessKey) || s.isSourceLockedLocked(source.Key) {
+		return false
+	}
+	s.externalBuffered[task.TaskID] = externalBufferedTask{
+		Task:         task,
+		Source:       source,
+		BusinessKey:  businessKey,
+		PrefetchedAt: nowString(),
+	}
+	s.externalBufferQ = append(s.externalBufferQ, task.TaskID)
+	s.externalBusiness[businessKey] = task.TaskID
+	s.externalSources[source.Key] = task.TaskID
+	return true
+}
+
+func (s *Service) reserveExternalClaim(task clientTask, source sourceCandidate, workerID string, workerName string) bool {
+	businessKey := buildBusinessKey(task)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.hasBusinessKeyLocked(businessKey) || s.isSourceLockedLocked(source.Key) {
+		return false
+	}
+	s.externalClaims[task.TaskID] = externalClaim{
+		Task:        task,
+		Source:      source,
+		BusinessKey: businessKey,
+		WorkerID:    workerID,
+		WorkerName:  workerName,
+		ClaimedAt:   nowString(),
+	}
+	s.externalBusiness[businessKey] = task.TaskID
+	s.externalSources[source.Key] = task.TaskID
+	return true
+}
+
+func (s *Service) claimBufferedExternalTask(sourceCode string, workerID string, workerName string) (clientTask, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, taskID := range s.externalBufferQ {
+		buffered, ok := s.externalBuffered[taskID]
+		if !ok {
+			continue
+		}
+		if sourceCode != "" && buffered.Task.SourceCode != sourceCode {
+			continue
+		}
+		delete(s.externalBuffered, taskID)
+		s.externalClaims[taskID] = externalClaim{
+			Task:        buffered.Task,
+			Source:      buffered.Source,
+			BusinessKey: buffered.BusinessKey,
+			WorkerID:    workerID,
+			WorkerName:  workerName,
+			ClaimedAt:   nowString(),
+		}
+		s.externalBufferQ = removeTaskIDFromQueue(s.externalBufferQ, taskID)
+		return buffered.Task, true
+	}
+	return clientTask{}, false
+}
+
+func (s *Service) getExternalClaim(taskID string) (externalClaim, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	claim, ok := s.externalClaims[taskID]
+	return claim, ok
+}
+
+func (s *Service) releaseExternalBuffered(taskID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	buffered, ok := s.externalBuffered[taskID]
+	if !ok {
+		return
+	}
+	delete(s.externalBuffered, taskID)
+	s.externalBufferQ = removeTaskIDFromQueue(s.externalBufferQ, taskID)
+	delete(s.externalBusiness, buffered.BusinessKey)
+	delete(s.externalSources, buffered.Source.Key)
+}
+
+func (s *Service) releaseExternalClaim(taskID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	claim, ok := s.externalClaims[taskID]
+	if !ok {
+		return
+	}
+	delete(s.externalClaims, taskID)
+	delete(s.externalBusiness, claim.BusinessKey)
+	delete(s.externalSources, claim.Source.Key)
 }
 
 func (s *Service) nextCandidateCursor(size int) int {
@@ -1870,6 +2896,10 @@ func activeURLTemplates(cfg rt.SystemConfig) []rt.URLTemplateRecord {
 	if !cfg.UseURLTemplates {
 		return nil
 	}
+	return configuredURLTemplates(cfg)
+}
+
+func configuredURLTemplates(cfg rt.SystemConfig) []rt.URLTemplateRecord {
 	result := make([]rt.URLTemplateRecord, 0, len(cfg.URLTemplates))
 	for _, tpl := range cfg.URLTemplates {
 		if strings.TrimSpace(tpl.Template) == "" {
@@ -2057,6 +3087,8 @@ func detailToMap(record rt.DetailRecord) map[string]any {
 		"template_label":     record.TemplateLabel,
 		"recognition_engine": record.RecognitionEngine,
 		"adb_command":        record.ADBCommand,
+		"submit_status_code": record.SubmitStatusCode,
+		"submit_error":       record.SubmitError,
 	}
 }
 

@@ -1,5 +1,6 @@
 import type {
   DashboardState,
+  DetailListResponse,
   DebugCaptureResult,
   MockDataImportResult,
   DebugSelectionTestResult,
@@ -18,9 +19,22 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, init)
   if (!response.ok) {
     const text = await response.text()
-    throw new Error(text || 'Request failed')
+    throw new Error(extractErrorMessage(text) || 'Request failed')
   }
   return response.json() as Promise<T>
+}
+
+function extractErrorMessage(text: string): string {
+  const raw = text.trim()
+  if (!raw) return ''
+  try {
+    const payload = JSON.parse(raw) as Record<string, unknown>
+    const detail = typeof payload.detail === 'string' ? payload.detail.trim() : ''
+    const error = typeof payload.error === 'string' ? payload.error.trim() : ''
+    return detail || error || raw
+  } catch {
+    return raw
+  }
 }
 
 export function getWsUrl(): string {
@@ -42,6 +56,12 @@ export function getAssetUrl(path?: string | null): string {
 
 export function fetchState(rangeKey: string): Promise<DashboardState> {
   return request<DashboardState>(`/api/state?range_key=${rangeKey}`)
+}
+
+export function fetchDetails(rangeKey: string, limit = 30, offset = 0): Promise<DetailListResponse> {
+  return request<DetailListResponse>(
+    `/api/details?range_key=${encodeURIComponent(rangeKey)}&limit=${limit}&offset=${offset}`,
+  )
 }
 
 export function fetchDevices(): Promise<DeviceInfo[]> {

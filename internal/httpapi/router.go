@@ -38,6 +38,7 @@ func NewRouter(cfg config.Config, hub *ws.Hub, tasks *task.Service, tpl *templat
 
 	mux.HandleFunc("/api/health", deps.handleHealth)
 	mux.HandleFunc("/api/state", deps.handleState)
+	mux.HandleFunc("/api/details", deps.handleDetails)
 	mux.HandleFunc("/api/runtime/summary", deps.handleSummary)
 	mux.HandleFunc("/api/upstreams", deps.handleUpstreams)
 	mux.HandleFunc("/api/upstreams/{upstreamId}", deps.handleUpstreamByID)
@@ -64,6 +65,9 @@ func NewRouter(cfg config.Config, hub *ws.Hub, tasks *task.Service, tpl *templat
 	mux.HandleFunc("/api/platform-accounts/{accountId}/test-fetch", deps.handleTestPlatformAccountFetch)
 	mux.HandleFunc("/api/platform-accounts/{accountId}/toggle", deps.handleTogglePlatformAccount)
 	mux.HandleFunc("/api/platform-accounts/{accountId}", deps.handleDeletePlatformAccount)
+	mux.HandleFunc("/api/external/fetch-task", deps.handleExternalFetchTask)
+	mux.HandleFunc("/api/external/url-templates", deps.handleExternalURLTemplates)
+	mux.HandleFunc("/api/external/submit-task", deps.handleExternalSubmitTask)
 	mux.HandleFunc("/api/mock-data/import", deps.handleImportMockData)
 	mux.Handle("/ws/events", deps.Hub)
 	mux.Handle("/api/assets/templates/", http.StripPrefix("/api/assets/templates/", http.FileServer(http.Dir(tpl.ImageDir()))))

@@ -24,7 +24,7 @@ type adapterUpstreamPayload struct {
 	Enabled      bool    `json:"enabled"`
 	Priority     int     `json:"priority"`
 	BaseURL      string  `json:"base_url,omitempty"`
-	ProxyURL     string  `json:"proxy_url,omitempty"`
+	ProxyURL     string  `json:"proxy_url"`
 	Notes        *string `json:"notes,omitempty"`
 }
 
