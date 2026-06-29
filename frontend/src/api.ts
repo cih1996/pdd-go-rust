@@ -96,6 +96,14 @@ export function stopTasks(deviceIds: string[]): Promise<{ stopped: string[]; mis
   })
 }
 
+export function getSubmitCount(): Promise<{ submit_count: number }> {
+  return request('/api/tasks/submit-count')
+}
+
+export function resetSubmitCount(): Promise<{ submit_count: number }> {
+  return request('/api/tasks/submit-count/reset', { method: 'POST' })
+}
+
 export function updateDeviceURLTemplates(deviceId: string, templateIds: string[]): Promise<{ message: string; device: DeviceInfo }> {
   return request(`/api/devices/${encodeURIComponent(deviceId)}/url-templates`, {
     method: 'POST',
