@@ -303,6 +303,10 @@ type externalFetchCandidateResult struct {
 	Err       error
 }
 
+func (s *Service) Runtime() *rt.Store {
+	return s.runtime
+}
+
 func NewService(cfg config.Config, hub *ws.Hub, tpl *template.Store, visionEngine *vision.Engine, devices *device.Service, ups *upstream.Store, accounts *account.Store, runtimeStore *rt.Store) *Service {
 	service := &Service{
 		cfg:              cfg,
@@ -720,6 +724,13 @@ func (s *Service) Start(deviceIDs []string, mode string) ([]string, []string) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.runtime.SubmitCount() >= 1000 {
+		s.emitEvent("warning", "提交次数已达上限(1000)，已自动停止任务", "", map[string]any{"submit_count": s.runtime.SubmitCount()})
+		skipped = append(skipped, deviceIDs...)
+		return started, skipped
+	}
+
 	for _, deviceID := range deviceIDs {
 		if _, exists := s.workers[deviceID]; exists {
 			skipped = append(skipped, deviceID)
@@ -1075,6 +1086,21 @@ func (s *Service) submitTaskWithMessage(ctx context.Context, deviceID string, ta
 		return &adapterRequestError{
 			StatusCode: resp.StatusCode,
 			Message:    buildAdapterErrorMessage(responseBody, responseText),
+		}
+	}
+	if submitType == "success" {
+		s.runtime.IncrementSubmitCount()
+		if s.runtime.SubmitCount() >= 1000 {
+			s.emitEvent("warning", "submit limit reached", "", map[string]any{"submit_count": s.runtime.SubmitCount()})
+			deviceIDs := make([]string, 0)
+			s.mu.Lock()
+			for id := range s.workers {
+				deviceIDs = append(deviceIDs, id)
+			}
+			s.mu.Unlock()
+			if len(deviceIDs) > 0 {
+				s.Stop(deviceIDs)
+			}
 		}
 	}
 	return nil
@@ -1580,6 +1606,7 @@ func (s *Service) emitState() {
 			"upstream_configs":    s.upstream.List(),
 			"platform_accounts":   s.accounts.List(),
 			"upstream_options":    buildUpstreamOptions(s.upstream.List()),
+			"submit_count": s.runtime.SubmitCount(),
 		},
 	})
 }

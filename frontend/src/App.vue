@@ -2,6 +2,7 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import {
   captureDebugScreen,
+  resetSubmitCount,
   clearDetails,
   connectDevice,
   createTemplate,
@@ -138,6 +139,7 @@ const pendingTasks = computed<PendingTaskRecord[]>(() => state.value.pending_tas
 const adapterSubmitLogs = computed<AdapterSubmitLogRecord[]>(() => state.value.adapter_submit_logs)
 const upstreamConfigs = computed<UpstreamConfigRecord[]>(() => state.value.upstream_configs)
 const platformAccounts = computed<PlatformAccountRecord[]>(() => state.value.platform_accounts)
+const submitCount = computed(() => state.value.submit_count ?? 0)
 const serviceLinks = computed<ServiceLinkStatus[]>(() => state.value.service_links)
 const isElectron = window.desktopApp?.isElectron === true
 const desktopUpdateStatus = ref<DesktopUpdateStatus | null>(null)
@@ -291,6 +293,16 @@ function stopStatePoll() {
   if (statePollTimer !== null) {
     window.clearInterval(statePollTimer)
     statePollTimer = null
+  }
+}
+
+async function handleResetSubmitCount() {
+  try {
+    await resetSubmitCount()
+    ElMessage.success('提交计数已重置')
+    void loadState()
+  } catch (error) {
+    ElMessage.error(String(error))
   }
 }
 
@@ -1147,6 +1159,13 @@ onUnmounted(() => {
       </el-header>
 
       <el-main style="padding: 24px;">
+        <div v-if="activeTab === 'task'" style="margin-bottom: 16px; display: flex; align-items: center; gap: 16px; padding: 12px 16px; background: #f0f9ff; border: 1px solid #bae6fd; border-radius: 8px;">
+          <span style="font-weight: 600; color: #0369a1;">提交计数</span>
+          <span style="font-size: 24px; font-weight: 700; color: submitCount >= 900 ? '#dc2626' : '#0369a1';">{{ submitCount }}</span>
+          <span style="color: #64748b;">/ 1000</span>
+          <el-progress :percentage="Math.min(100, Math.round(submitCount / 10))" :stroke-width="8" style="flex: 1; max-width: 300px;" :color="submitCount >= 900 ? '#dc2626' : submitCount >= 700 ? '#f59e0b' : '#0ea5e9'" />
+          <el-button size="small" @click="handleResetSubmitCount">重置计数</el-button>
+        </div>
         <TaskTab
           v-if="activeTab === 'task'"
           :devices="devices"

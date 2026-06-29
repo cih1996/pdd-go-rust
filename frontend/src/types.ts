@@ -288,6 +288,7 @@ export interface DashboardState {
   upstream_options: UpstreamOption[]
   service_links: ServiceLinkStatus[]
   adapter_state?: AdapterStatePayload | null
+  submit_count?: number
 }
 
 export interface DetailListResponse {

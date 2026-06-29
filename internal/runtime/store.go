@@ -126,6 +126,7 @@ type PersistedData struct {
 	PendingTasks     []PendingTaskRecord      `json:"pending_tasks"`
 	AdapterSubmitLog []AdapterSubmitLogRecord `json:"adapter_submit_log"`
 	SystemConfig     SystemConfig             `json:"system_config"`
+	SubmitCount      int                      `json:"submit_count"`
 }
 
 type Backend interface {
@@ -142,6 +143,7 @@ type Store struct {
 	adapterSubmitLog []AdapterSubmitLogRecord
 	systemConfig     SystemConfig
 	summary          Summary
+	submitCount      int
 	backend          Backend
 }
 
@@ -168,6 +170,7 @@ func NewStore(backend Backend) *Store {
 			store.pendingTasks = data.PendingTasks
 			store.adapterSubmitLog = data.AdapterSubmitLog
 			store.systemConfig = data.SystemConfig
+			store.submitCount = data.SubmitCount
 		}
 	}
 	if store.summary.Daily == nil {
@@ -443,6 +446,7 @@ func (s *Store) persistLocked() {
 		PendingTasks:     clonePending(s.pendingTasks),
 		AdapterSubmitLog: cloneAdapterLogs(s.adapterSubmitLog),
 		SystemConfig:     cloneSystemConfig(s.systemConfig),
+		SubmitCount:      s.submitCount,
 	})
 }
 
@@ -476,4 +480,24 @@ func cloneSummary(value Summary) Summary {
 		}
 	}
 	return result
+}
+
+func (s *Store) SubmitCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.submitCount
+}
+
+func (s *Store) IncrementSubmitCount() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.submitCount++
+	s.persistLocked()
+}
+
+func (s *Store) ResetSubmitCount() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.submitCount = 0
+	s.persistLocked()
 }

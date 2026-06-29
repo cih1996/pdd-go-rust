@@ -55,6 +55,8 @@ func NewRouter(cfg config.Config, hub *ws.Hub, tasks *task.Service, tpl *templat
 	mux.HandleFunc("/api/debug/capture", deps.handleDebugCapture)
 	mux.HandleFunc("/api/debug/match-selection", deps.handleDebugMatchSelection)
 	mux.HandleFunc("/api/debug/ocr-selection", deps.handleDebugOCRSelection)
+	mux.HandleFunc("/api/tasks/submit-count", deps.handleSubmitCount)
+	mux.HandleFunc("/api/tasks/submit-count/reset", deps.handleResetSubmitCount)
 	mux.HandleFunc("/api/tasks/start", deps.handleStartTask)
 	mux.HandleFunc("/api/tasks/stop", deps.handleStopTask)
 	mux.HandleFunc("/api/devices", deps.handleDevices)

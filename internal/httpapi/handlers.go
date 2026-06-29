@@ -14,6 +14,24 @@ import (
 	"unified-server/internal/upstream"
 )
 
+// Submit count endpoints
+func (d RouterDeps) handleSubmitCount(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		writeJSON(w, http.StatusOK, map[string]any{"submit_count": d.Tasks.Runtime().SubmitCount()})
+		return
+	}
+	writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+}
+
+func (d RouterDeps) handleResetSubmitCount(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+		return
+	}
+	d.Tasks.Runtime().ResetSubmitCount()
+	writeJSON(w, http.StatusOK, map[string]any{"submit_count": 0})
+}
+
 func (d RouterDeps) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"success": true,
