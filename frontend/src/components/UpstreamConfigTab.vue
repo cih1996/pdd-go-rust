@@ -399,7 +399,7 @@ function submitMockData() {
       class="modern-dialog"
     >
       <el-alert
-        title="导入的临时任务数据仅用于 mock_upstream，不替代正式配置。系统自动提取 goods_id 和 sku_id。"
+        title="导入的临时任务数据仅用于 mock_upstream。支持每行格式：URL|规格1,规格2|商品标题 或纯 URL。系统自动提取 goods_id、sku_id、goods_name 和 sku_names。"
         type="warning"
         :closable="false"
         class="mb-4"
@@ -440,7 +440,7 @@ function submitMockData() {
             v-model="mockImportForm.content"
             type="textarea"
             :rows="6"
-            placeholder="每行一个链接，例如：https://...goods_id=...&sku_id=..."
+            placeholder="每行一个链接，支持格式：&#10;https://...goods_id=...&sku_id=...&#10;https://...goods_id=...&sku_id=...|套餐1,套餐2|商品标题&#10;https://...goods_id=...&sku_id=...|套餐1,套餐2"
           />
         </el-form-item>
       </el-form>

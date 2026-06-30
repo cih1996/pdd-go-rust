@@ -884,12 +884,47 @@ fn extract_task_items_from_value(payload: &Value) -> Vec<ClientTaskItem> {
         string_field(payload.get("url")).or_else(|| string_field(payload.get("source_url")));
     let goods_id = string_field(payload.get("goods_id")).unwrap_or_default();
     let sku_id = string_field(payload.get("sku_id")).unwrap_or_default();
-    if !goods_id.is_empty() {
+
+    // 检查是否有 enrich 标记（来自 | 分隔的行解析）
+    let has_enrich = payload.get("_has_enrich").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    if !goods_id.is_empty() || has_enrich {
+        let enriched_goods_name = if has_enrich {
+            string_field(payload.get("goods_name"))
+        } else {
+            None
+        };
+        let enriched_sku_names = if has_enrich {
+            payload
+                .get("sku_names")
+                .and_then(|v| v.as_array())
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|v| v.trim().to_string())
+                        .filter(|v| !v.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         return vec![ClientTaskItem {
-            goods_id: goods_id.clone(),
-            goods_name: None,
-            sku_id: if sku_id.is_empty() { goods_id } else { sku_id },
-            sku_name: Vec::new(),
+            goods_id: if goods_id.is_empty() {
+                // 从 URL 提取或 fallback
+                extract_goods_id_from_url(url_value.as_deref().unwrap_or_default())
+            } else {
+                goods_id.clone()
+            },
+            goods_name: enriched_goods_name,
+            sku_id: if sku_id.is_empty() {
+                // 从 URL 提取 sku_id
+                extract_sku_id_from_url(url_value.as_deref().unwrap_or_default())
+            } else {
+                sku_id
+            },
+            sku_name: enriched_sku_names,
             source_url: url_value.clone(),
             step_index: 0,
         }];
@@ -897,6 +932,61 @@ fn extract_task_items_from_value(payload: &Value) -> Vec<ClientTaskItem> {
     url_value
         .map(|url| extract_mock_task_items_from_url(&url))
         .unwrap_or_default()
+}
+
+fn extract_goods_id_from_url(url: &str) -> String {
+    if let Ok(parsed) = Url::parse(url) {
+        for (key, value) in parsed.query_pairs() {
+            if key == "goods_id" {
+                return value.trim().to_string();
+            }
+        }
+    }
+    // 兜底：从 URL 中正则匹配 goods_id 数字
+    for key in &["goods_id=", "goods_id%3D", "goods_id\":"] {
+        if let Some(pos) = url.find(key) {
+            let start = pos + key.len();
+            let mut id = String::new();
+            for ch in url[start..].chars() {
+                if ch.is_ascii_digit() {
+                    id.push(ch);
+                } else {
+                    break;
+                }
+            }
+            if !id.is_empty() {
+                return id;
+            }
+        }
+    }
+    String::new()
+}
+
+fn extract_sku_id_from_url(url: &str) -> String {
+    if let Ok(parsed) = Url::parse(url) {
+        for (key, value) in parsed.query_pairs() {
+            if key == "sku_id" {
+                return value.trim().to_string();
+            }
+        }
+    }
+    for key in &["sku_id=", "sku_id%3D", "sku_id\":"] {
+        if let Some(pos) = url.find(key) {
+            let start = pos + key.len();
+            let mut id = String::new();
+            for ch in url[start..].chars() {
+                if ch.is_ascii_digit() {
+                    id.push(ch);
+                } else {
+                    break;
+                }
+            }
+            if !id.is_empty() {
+                return id;
+            }
+        }
+    }
+    String::new()
 }
 
 fn extract_mock_task_items_from_url(raw_url: &str) -> Vec<ClientTaskItem> {
@@ -1027,12 +1117,50 @@ fn extract_mock_task_items_from_source(raw: &str, depth: usize) -> Vec<ClientTas
     Vec::new()
 }
 
+/// 解析行格式：`<URL>|<sku_name1,sku_name2,...>|<goods_name>`
+/// 或纯 URL：`<URL>`
 fn build_mock_records_from_lines(lines: &str) -> Vec<Value> {
     lines
         .lines()
         .map(|line| line.trim())
         .filter(|line| !line.is_empty())
-        .map(|line| json!({ "url": line.trim_matches('`').trim_matches('"') }))
+        .map(|line| {
+            let raw = line.trim_matches('`').trim_matches('"');
+            let parts: Vec<&str> = raw.splitn(3, '|').map(|s| s.trim()).collect();
+            match parts.len() {
+                3 => {
+                    let url = parts[0];
+                    let sku_names: Vec<String> = parts[1]
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    let goods_name = parts[2].to_string();
+                    json!({
+                        "url": url,
+                        "source_url": url,
+                        "goods_name": goods_name,
+                        "sku_names": sku_names,
+                        "_has_enrich": true
+                    })
+                }
+                2 => {
+                    let url = parts[0];
+                    let sku_names: Vec<String> = parts[1]
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    json!({
+                        "url": url,
+                        "source_url": url,
+                        "sku_names": sku_names,
+                        "_has_enrich": true
+                    })
+                }
+                _ => json!({ "url": raw }),
+            }
+        })
         .collect()
 }
 

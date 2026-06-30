@@ -212,6 +212,12 @@ func (s *Store) Snapshot() (Summary, []EventRecord, []DetailRecord, []PendingTas
 	return s.summary, cloneEvents(s.eventLog), cloneDetails(s.details), clonePending(s.pendingTasks), cloneAdapterLogs(s.adapterSubmitLog), s.systemConfig
 }
 
+func (s *Store) SnapshotWithoutDetails() (Summary, []EventRecord, []PendingTaskRecord, []AdapterSubmitLogRecord, SystemConfig) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.summary, cloneEvents(s.eventLog), clonePending(s.pendingTasks), cloneAdapterLogs(s.adapterSubmitLog), s.systemConfig
+}
+
 func (s *Store) Summary() Summary {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

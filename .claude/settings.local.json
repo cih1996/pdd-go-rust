@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo check *)",
+      "Bash(less /Users/cih1996/dev/work/pdd-go-rust/frontend/src/api.ts)"
+    ]
+  }
+}

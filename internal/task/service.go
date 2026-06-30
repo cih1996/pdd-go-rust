@@ -59,7 +59,13 @@ type Service struct {
 	externalBusiness map[string]string
 	externalSources  map[string]string
 	urlTemplateState map[string]deviceURLTemplateState
+
+	emitMu      sync.Mutex
+	emitTimer   *time.Timer
+	emitPending bool
 }
+
+const emitStateDebounce = 250 * time.Millisecond
 
 type startRequest struct {
 	DeviceIDs []string `json:"device_ids"`
@@ -427,7 +433,7 @@ func (s *Service) releaseExpiredExternalClaim(claim externalClaim) {
 		"source_code":       claim.Task.SourceCode,
 		"timeout_seconds":   int(externalClaimTimeout / time.Second),
 	})
-	s.emitState()
+	s.emitStateImmediate()
 }
 
 func (s *Service) releaseExpiredExternalBufferedTask(buffered externalBufferedTask) {
@@ -671,7 +677,7 @@ func (s *Service) SubmitExternalTask(ctx context.Context, req ExternalSubmitRequ
 		detailRecords[index] = stored
 		s.hub.Broadcast(ws.Event{Type: "detail", Data: map[string]any(detailToMap(stored))})
 	}
-	s.emitState()
+	s.emitStateImmediate()
 
 	if submitErr != nil {
 		return ExternalSubmitResponse{
@@ -797,7 +803,7 @@ func (s *Service) runWorker(ctx context.Context, deviceID string, mode string) {
 			s.releaseAllGroupedTasks(context.Background(), "cancelled", "全部设备已停止，已主动释放已领取任务")
 		}
 		s.emitEvent("info", "设备任务循环已停止", deviceID, nil)
-		s.emitState()
+		s.emitStateImmediate()
 	}()
 
 	for {
@@ -892,7 +898,7 @@ func (s *Service) runWorker(ctx context.Context, deviceID string, mode string) {
 						"submit_status_code": detail.SubmitStatusCode,
 						"submit_error":       detail.SubmitError,
 					})
-					s.emitState()
+					s.emitStateImmediate()
 					return
 				}
 			} else {
@@ -1592,7 +1598,24 @@ func (s *Service) emitEvent(level string, message string, deviceID string, paylo
 }
 
 func (s *Service) emitState() {
-	summary, events, _, pending, adapterLogs, systemConfig := s.runtime.Snapshot()
+	s.emitMu.Lock()
+	defer s.emitMu.Unlock()
+
+	if s.emitTimer == nil {
+		s.emitTimer = time.AfterFunc(emitStateDebounce, s.emitStateNow)
+	}
+	if !s.emitPending {
+		s.emitPending = true
+		s.emitTimer.Reset(emitStateDebounce)
+	}
+}
+
+func (s *Service) emitStateNow() {
+	s.emitMu.Lock()
+	s.emitPending = false
+	s.emitMu.Unlock()
+
+	summary, events, pending, adapterLogs, systemConfig := s.runtime.SnapshotWithoutDetails()
 	s.hub.Broadcast(ws.Event{
 		Type: "state",
 		Data: map[string]any{
@@ -1606,9 +1629,19 @@ func (s *Service) emitState() {
 			"upstream_configs":    s.upstream.List(),
 			"platform_accounts":   s.accounts.List(),
 			"upstream_options":    buildUpstreamOptions(s.upstream.List()),
-			"submit_count": s.runtime.SubmitCount(),
+			"submit_count":        s.runtime.SubmitCount(),
 		},
 	})
+}
+
+func (s *Service) emitStateImmediate() {
+	s.emitMu.Lock()
+	if s.emitTimer != nil {
+		s.emitTimer.Stop()
+	}
+	s.emitPending = false
+	s.emitMu.Unlock()
+	s.emitStateNow()
 }
 
 func (s *Service) workerCount() int {
@@ -1720,7 +1753,7 @@ func (s *Service) releaseExpiredGroupedTasks(ctx context.Context) {
 			"timeout_seconds":   int(groupTaskTimeout / time.Second),
 		})
 	}
-	s.emitState()
+	s.emitStateImmediate()
 }
 
 func (s *Service) fillPending(ctx context.Context) {
@@ -2012,7 +2045,7 @@ func (s *Service) enqueuePendingGroup(task clientTask, source sourceCandidate, b
 		"task_item_count":   len(task.TaskItems),
 		"upstream_task_ref": task.UpstreamTaskRef,
 	})
-	s.emitState()
+	s.emitStateImmediate()
 }
 
 func (s *Service) takePendingTask() (pendingTask, sourceCandidate, bool) {
@@ -2317,7 +2350,7 @@ func (s *Service) releaseAllGroupedTasks(ctx context.Context, submitType string,
 			s.emitEvent("error", "主动释放任务失败", "", map[string]any{"task_id": submission.Task.TaskID, "error": err.Error()})
 		}
 	}
-	s.emitState()
+	s.emitStateImmediate()
 }
 
 func (s *Service) requeueInterruptedTask(item pendingTask) {
@@ -2331,7 +2364,7 @@ func (s *Service) requeueInterruptedTask(item pendingTask) {
 	}
 	s.mu.Unlock()
 	s.syncPendingGroupRecord(item.ParentKey)
-	s.emitState()
+	s.emitStateImmediate()
 }
 
 func (s *Service) finalizeChildSuccess(item pendingTask, submitItem clientSubmitTaskItem) *groupSubmission {
@@ -2369,7 +2402,7 @@ func (s *Service) finalizeChildSuccess(item pendingTask, submitItem clientSubmit
 	delete(s.groups, item.ParentKey)
 	s.mu.Unlock()
 	s.runtime.RemovePendingTask(item.Task.TaskID)
-	s.emitState()
+	s.emitStateImmediate()
 	return submission
 }
 
@@ -2399,7 +2432,7 @@ func (s *Service) finalizeChildFailure(item pendingTask, detail rt.DetailRecord,
 	delete(s.groups, item.ParentKey)
 	s.mu.Unlock()
 	s.runtime.RemovePendingTask(item.Task.TaskID)
-	s.emitState()
+	s.emitStateImmediate()
 	return submission
 }
 

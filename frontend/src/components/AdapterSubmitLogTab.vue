@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { Search, Refresh } from '@element-plus/icons-vue'
 import type { AdapterSubmitLogRecord } from '../types'
 import { formatApiDateTime } from '../utils/datetime'
@@ -14,6 +14,12 @@ const emit = defineEmits<{
 
 const keyword = ref('')
 const expandedLogId = ref('')
+const currentPage = ref(1)
+const pageSize = ref(25)
+
+watch(keyword, () => {
+  currentPage.value = 1
+})
 
 function formatDateTime(value?: string | null) {
   return formatApiDateTime(value)
@@ -70,6 +76,11 @@ const filteredLogs = computed(() => {
     ].some((value) => String(value ?? '').includes(search)),
   )
 })
+
+const paginatedLogs = computed(() => {
+  const start = (currentPage.value - 1) * pageSize.value
+  return filteredLogs.value.slice(start, start + pageSize.value)
+})
 </script>
 
 <template>
@@ -95,7 +106,7 @@ const filteredLogs = computed(() => {
       <el-empty v-if="filteredLogs.length === 0" description="暂无适配器交互日志" :image-size="80" />
       <div v-else class="submit-log-list">
         <div
-          v-for="item in filteredLogs"
+          v-for="item in paginatedLogs"
           :key="item.id"
           class="submit-log-item"
           :class="{ 'submit-log-item-expanded': expandedLogId === item.id }"
@@ -152,6 +163,17 @@ const filteredLogs = computed(() => {
             </el-row>
           </div>
         </div>
+      </div>
+      <div class="submit-log-footer" v-if="filteredLogs.length > 0">
+        <el-pagination
+          v-model:current-page="currentPage"
+          v-model:page-size="pageSize"
+          :total="filteredLogs.length"
+          :page-sizes="[15, 25, 50, 100]"
+          layout="total, sizes, prev, pager, next, jumper"
+          background
+          small
+        />
       </div>
     </div>
   </div>
@@ -353,5 +375,13 @@ const filteredLogs = computed(() => {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.submit-log-footer {
+  display: flex;
+  justify-content: center;
+  padding: 16px 0 0;
+  border-top: 1px solid #e2e8f0;
+  margin-top: 16px;
 }
 </style>

@@ -130,6 +130,9 @@ let statePollTimer: number | null = null
 let wsManuallyClosed = false
 const wsConnected = ref(false)
 const activeDebugRequestId = ref('')
+let pollIntervalMs = 3000
+const POLL_MIN_MS = 3000
+const POLL_MAX_MS = 30000
 
 const devices = computed<DeviceInfo[]>(() => state.value.devices)
 const templates = computed<TemplateRecord[]>(() => state.value.templates)
@@ -282,16 +285,24 @@ function scheduleWsReconnect() {
 
 function startStatePoll() {
   if (statePollTimer !== null) return
-  statePollTimer = window.setInterval(() => {
-    if (!wsConnected.value && !loading.value) {
-      void loadState()
-    }
-  }, 3000)
+  statePollTimer = window.setTimeout(pollTick, pollIntervalMs)
+}
+
+function pollTick() {
+  statePollTimer = null
+  if (!wsConnected.value && !loading.value) {
+    void loadState().finally(() => {
+      if (!wsConnected.value) {
+        pollIntervalMs = Math.min(pollIntervalMs * 2, POLL_MAX_MS)
+        statePollTimer = window.setTimeout(pollTick, pollIntervalMs)
+      }
+    })
+  }
 }
 
 function stopStatePoll() {
   if (statePollTimer !== null) {
-    window.clearInterval(statePollTimer)
+    window.clearTimeout(statePollTimer)
     statePollTimer = null
   }
 }
@@ -312,6 +323,7 @@ function connectWs() {
   ws = new WebSocket(getWsUrl())
   ws.onopen = () => {
     wsConnected.value = true
+    pollIntervalMs = POLL_MIN_MS
     stopStatePoll()
     void loadState(true)
   }

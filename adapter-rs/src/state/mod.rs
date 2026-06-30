@@ -16,6 +16,8 @@ use crate::models::{
 const LOG_LIMIT: usize = 120;
 const REPORT_LIMIT: usize = 120;
 const SNAPSHOT_LIMIT: usize = 200;
+const ISSUED_TASK_LIMIT: usize = 500;
+const CAPTURE_CACHE_LIMIT: usize = 200;
 
 #[derive(Default)]
 pub struct AdapterRuntime {
@@ -269,6 +271,13 @@ impl AppState {
         runtime
             .issued_tasks
             .insert(context.task.task_id.clone(), context.clone());
+        if runtime.issued_tasks.len() > ISSUED_TASK_LIMIT {
+            let excess = runtime.issued_tasks.len() - ISSUED_TASK_LIMIT;
+            let keys: Vec<String> = runtime.issued_tasks.keys().take(excess).cloned().collect();
+            for key in keys {
+                runtime.issued_tasks.remove(&key);
+            }
+        }
     }
 
     pub fn take_issued_task(&self, task_id: &str) -> Option<IssuedTaskContext> {
@@ -379,6 +388,13 @@ impl AppState {
 
         let mut runtime = self.runtime.write().expect("runtime poisoned");
         runtime.captures.insert(capture_id, stored);
+        if runtime.captures.len() > CAPTURE_CACHE_LIMIT {
+            let excess = runtime.captures.len() - CAPTURE_CACHE_LIMIT;
+            let keys: Vec<String> = runtime.captures.keys().take(excess).cloned().collect();
+            for key in keys {
+                runtime.captures.remove(&key);
+            }
+        }
         drop(runtime);
         Ok(response)
     }
