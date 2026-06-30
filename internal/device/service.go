@@ -20,6 +20,7 @@ type Info struct {
 	Stats                  Stats        `json:"stats"`
 	CurrentTask            *CurrentTask `json:"current_task,omitempty"`
 	SelectedURLTemplateIDs []string     `json:"selected_url_template_ids,omitempty"`
+	SelectedTaskModeEx     string       `json:"selected_task_mode_ex,omitempty"`
 }
 
 type Service struct {
@@ -230,6 +231,23 @@ func (s *Service) SelectedURLTemplateIDs(serial string) []string {
 		return nil
 	}
 	return append([]string(nil), item.SelectedURLTemplateIDs...)
+}
+
+func (s *Service) UpdateTaskModeSelection(serial string, modeEx string) Info {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	item := s.items[serial]
+	item.ID = serial
+	item.Serial = serial
+	item.SelectedTaskModeEx = modeEx
+	s.items[serial] = item
+	return item
+}
+
+func (s *Service) SelectedTaskModeEx(serial string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.items[serial].SelectedTaskModeEx
 }
 
 func (s *Service) get(serial string) Info {

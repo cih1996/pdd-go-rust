@@ -112,6 +112,14 @@ export function updateDeviceURLTemplates(deviceId: string, templateIds: string[]
   })
 }
 
+export function updateDeviceTaskMode(deviceId: string, modeEx: string): Promise<{ message: string; device: DeviceInfo }> {
+  return request(`/api/devices/${encodeURIComponent(deviceId)}/task-mode`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mode_ex: modeEx }),
+  })
+}
+
 export function exportTemplates(): void {
   window.open(`${API_BASE}/api/templates/export`, '_blank')
 }

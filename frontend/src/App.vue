@@ -30,6 +30,7 @@ import {
   togglePlatformAccount,
   toggleUpstreamConfig,
   updateDeviceURLTemplates,
+  updateDeviceTaskMode,
   updateTemplate,
   updateUpstreamConfig,
   updateSystemConfig,
@@ -468,6 +469,17 @@ async function handleSaveDeviceURLTemplates(payload: { device_id: string; templa
     await loadState()
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '保存设备 URL 模板失败'
+    ElMessage.error(errorMessage.value)
+  }
+}
+
+async function handleSaveDeviceTaskMode(payload: { device_id: string; mode_ex: string }) {
+  try {
+    await updateDeviceTaskMode(payload.device_id, payload.mode_ex)
+    ElMessage.success('设备任务模式已保存')
+    await loadState()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '保存任务模式失败'
     ElMessage.error(errorMessage.value)
   }
 }
@@ -1201,6 +1213,7 @@ onUnmounted(() => {
           @stop-device="handleStopSingle"
           @inspect-device="handleInspectDevice"
           @save-device-url-templates="handleSaveDeviceURLTemplates"
+          @save-device-task-mode="handleSaveDeviceTaskMode"
           @refresh="loadState"
         />
 

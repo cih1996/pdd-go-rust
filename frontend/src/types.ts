@@ -1,5 +1,6 @@
 export type TaskMode = 'mock' | 'live'
-export type TemplateType = 'account_risk' | 'fail_release' | 'success_image' | 'click_image'
+export type TemplateType = 'account_risk' | 'fail_release' | 'success_image' | 'click_image' |
+  'goods_confirm' | 'condition_mismatch' | 'need_coupon' | 'coupon_detail'
 export type RecognitionEngine = 'opencv' | 'ocr'
 
 export interface DeviceStats {
@@ -31,6 +32,7 @@ export interface DeviceInfo {
   running: boolean
   stats: DeviceStats
   selected_url_template_ids?: string[]
+  selected_task_mode_ex?: string | null
   current_task?: TaskProgress | null
 }
 

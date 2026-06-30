@@ -28,6 +28,7 @@ const emit = defineEmits<{
   (event: 'stop-device', value: string): void
   (event: 'inspect-device', value: string): void
   (event: 'save-device-url-templates', value: { device_id: string; template_ids: string[] }): void
+  (event: 'save-device-task-mode', value: { device_id: string; mode_ex: string }): void
   (event: 'refresh'): void
 }>()
 
@@ -35,8 +36,30 @@ const searchDevice = ref('')
 const deviceTemplateDialogVisible = ref(false)
 const editingDeviceId = ref('')
 const editingDeviceTemplateIDs = ref<string[]>([])
+const deviceTaskModeDialogVisible = ref(false)
+const editingDeviceTaskModeId = ref('')
+const editingDeviceTaskModeEx = ref('stealth')
 const TASK_WARNING_SECONDS = 6
 const TASK_DANGER_SECONDS = 10
+
+function openDeviceTaskModeDialog(row: DeviceInfo) {
+  editingDeviceTaskModeId.value = row.serial
+  editingDeviceTaskModeEx.value = row.selected_task_mode_ex || 'stealth'
+  deviceTaskModeDialogVisible.value = true
+}
+
+function saveDeviceTaskModeDialog() {
+  emit('save-device-task-mode', {
+    device_id: editingDeviceTaskModeId.value,
+    mode_ex: editingDeviceTaskModeEx.value,
+  })
+  deviceTaskModeDialogVisible.value = false
+}
+
+function modeDisplayLabel(modeEx?: string | null) {
+  if (modeEx === 'detail') return '详情'
+  return '无痕'
+}
 
 function taskElapsedSeconds(row: DeviceInfo) {
   if (!hasActiveTask(row) || !row.current_task?.started_at) return 0
@@ -266,9 +289,12 @@ onBeforeUnmount(() => {
             <el-table-column label="操作" width="180" align="center" fixed="right">
               <template #default="{ row }">
                 <div class="table-actions">
-                  <el-button link type="info" @click="openDeviceTemplateDialog(row)">
-                    模板{{ selectedURLTemplateCount(row) > 0 ? `(${selectedURLTemplateCount(row)})` : '' }}
-                  </el-button>
+t                  <el-button link type="info" @click="openDeviceTemplateDialog(row)">
+t                    模板{{ selectedURLTemplateCount(row) > 0 ? `(${selectedURLTemplateCount(row)})` : "" }}
+t                  </el-button>
+t                  <el-button link type="info" @click="openDeviceTaskModeDialog(row)">
+t                    模式({{ modeDisplayLabel(row.selected_task_mode_ex) }})
+t                  </el-button>
                   <el-button link type="primary" @click="emit('inspect-device', row.serial)">查看</el-button>
                   <el-button
                     v-if="!row.running"
@@ -397,6 +423,34 @@ onBeforeUnmount(() => {
       <template #footer>
         <el-button @click="deviceTemplateDialogVisible = false">取消</el-button>
         <el-button type="primary" @click="saveDeviceTemplateDialog">保存</el-button>
+      </template>
+    </el-dialog>
+    <el-dialog
+      v-model="deviceTaskModeDialogVisible"
+      title="选择任务模式"
+      width="450px"
+      destroy-on-close
+    >
+      <div class="mb-4 text-sm text-gray">
+        设备：<span class="mono-text">{{ editingDeviceTaskModeId || "-" }}</span>
+      </div>
+      <el-radio-group v-model="editingDeviceTaskModeEx">
+        <el-radio value="stealth" class="mode-option">
+          <div>
+            <div class="font-medium">无痕模式 (Stealth)</div>
+            <div class="text-xs text-gray">自动识别商品确认页，处理优惠券后直接通过</div>
+          </div>
+        </el-radio>
+        <el-radio value="detail" class="mode-option">
+          <div>
+            <div class="font-medium">详情模式 (Detail)</div>
+            <div class="text-xs text-gray">在无痕模式的基础上，进入规格选择页 OCR 校验 SKU 名称完整性</div>
+          </div>
+        </el-radio>
+      </el-radio-group>
+      <template #footer>
+        <el-button @click="deviceTaskModeDialogVisible = false">取消</el-button>
+        <el-button type="primary" @click="saveDeviceTaskModeDialog">保存</el-button>
       </template>
     </el-dialog>
   </div>

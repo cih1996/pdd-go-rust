@@ -336,7 +336,7 @@ func buildRecord(input UpsertInput, current Record) Record {
 	}
 	record.Priority = input.Priority
 	record.ExpectedText = strings.TrimSpace(input.ExpectedText)
-	record.RequiresClick = input.RequiresClick && record.TemplateType == "fail_release"
+	record.RequiresClick = input.RequiresClick && (record.TemplateType == "fail_release" || record.TemplateType == "need_coupon")
 	record.MatchOncePerTask = input.MatchOncePerTask
 	record.Threshold = input.Threshold
 	record.Method = strings.TrimSpace(input.Method)
@@ -392,12 +392,20 @@ func typeWeight(value string) int {
 	switch value {
 	case "account_risk":
 		return 1
-	case "fail_release":
+	case "goods_confirm":
 		return 2
-	case "click_image":
+	case "condition_mismatch":
 		return 3
-	case "success_image":
+	case "need_coupon":
 		return 4
+	case "coupon_detail":
+		return 5
+	case "fail_release":
+		return 6
+	case "click_image":
+		return 7
+	case "success_image":
+		return 8
 	default:
 		return 99
 	}

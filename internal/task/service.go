@@ -983,7 +983,18 @@ func (s *Service) executeTask(ctx context.Context, deviceID string, mode string,
 			sleepWithContext(ctx, durationFromSeconds(systemConfig.OpenURLDelaySeconds))
 		}
 
-		skuResult, shouldStop, matchedClick, matchedMeta, err := s.runTaskUntilTerminal(ctx, deviceID, mode, item, systemConfig)
+		modeEx := s.devices.SelectedTaskModeEx(deviceID)
+		var skuResult skuExecutionResult
+		var shouldStop bool
+		var matchedClick bool
+		var matchedMeta matchedTemplateMeta
+		var err error
+		switch strings.TrimSpace(modeEx) {
+		case "detail":
+			skuResult, shouldStop, matchedClick, matchedMeta, err = s.runDetailMode(ctx, deviceID, mode, item, systemConfig)
+		default:
+			skuResult, shouldStop, matchedClick, matchedMeta, err = s.runStealthMode(ctx, deviceID, mode, item, systemConfig)
+		}
 		if err != nil {
 			status := "failure"
 			recognition := "loop_failed"
@@ -1004,6 +1015,22 @@ func (s *Service) executeTask(ctx context.Context, deviceID string, mode string,
 			if strings.HasPrefix(message, "fail_release:") {
 				recognition = "fail_release"
 				message = strings.TrimPrefix(message, "fail_release:")
+			}
+			if strings.HasPrefix(message, "condition_mismatch:") {
+				recognition = "condition_mismatch"
+				message = strings.TrimPrefix(message, "condition_mismatch:")
+			}
+			if strings.HasPrefix(message, "coupon_detail:") {
+				recognition = "coupon_detail_missing"
+				message = strings.TrimPrefix(message, "coupon_detail:")
+			}
+			if strings.HasPrefix(message, "sku_name_mismatch:") {
+				recognition = "sku_name_mismatch"
+				message = strings.TrimPrefix(message, "sku_name_mismatch:")
+			}
+			if strings.HasPrefix(message, "goods_confirm:") {
+				recognition = "goods_confirm_timeout"
+				message = strings.TrimPrefix(message, "goods_confirm:")
 			}
 			message = detailMessageWithTemplate(message, matchedMeta)
 			return false, shouldStop, results, s.buildDetail(taskItem, &item, deviceID, mode, taskURL, status, recognition, nil, strings.TrimSpace(strings.Join(adbCommands, "\n")), message, &matchedMeta)
@@ -2510,6 +2537,316 @@ func (s *Service) uploadFailureEvidence(ctx context.Context, taskItem clientTask
 	}, []string{uploaded.CaptureURL}, nil
 }
 
+func (s *Service) runSteps1to4(ctx context.Context, deviceID string, mode string, item clientTaskItem, cfg rt.SystemConfig) (*verifiedFlowState, bool, matchedTemplateMeta, error) {
+	if s.vision.Mode() == "mock" {
+		return &verifiedFlowState{
+			goodsCapture: []byte("mock-capture"),
+			goodsTemplate: template.Record{
+				TemplateType:      "goods_confirm",
+				RecognitionEngine: "opencv",
+			},
+		}, false, matchedTemplateMeta{}, nil
+	}
+
+	var clickCapture []byte
+	var goodsCapture []byte
+	var couponCapture []byte
+	var goodsTemplate template.Record
+	matchedOnceTemplates := make(map[string]struct{})
+
+	// ---- Step 1: Loop up to 10 times, checking account_risk or goods_confirm ----
+	goodsFound := false
+	var loop int
+	for loop = 1; loop <= 10; loop++ {
+		s.devices.UpdateCurrentTask(deviceID, func(current *device.CurrentTask) {
+			current.LoopCount = loop
+			current.CurrentStage = "waiting_goods_confirm"
+			current.CurrentMessage = fmt.Sprintf("第 %d 轮等待商品确认页", loop)
+		})
+		s.emitState()
+
+		captureBytes, err := s.captureForMode(ctx, deviceID, mode)
+		if err != nil {
+			return nil, false, matchedTemplateMeta{}, fmt.Errorf("截图失败: %w", err)
+		}
+		cache := (*vision.OCRCache)(nil)
+
+		// Check account_risk first, fail immediately if matched
+		if matched, result, matchedTemplate, nextCache, err := s.matchStage("account_risk", captureBytes, cache, len(clickCapture) > 0, matchedOnceTemplates); err != nil {
+			return nil, false, matchedTemplateMeta{}, err
+		} else if matched {
+			rememberMatchedTemplate(matchedOnceTemplates, matchedTemplate)
+			meta := templateMetaFromRecord(matchedTemplate)
+			s.devices.UpdateCurrentTask(deviceID, func(current *device.CurrentTask) {
+				current.LastMatchedTemplate = matchedTemplate.Label
+				current.LastMatchedTemplateType = matchedTemplate.TemplateType
+				current.LastMatchedRecognitionEngine = matchedTemplate.RecognitionEngine
+				current.CurrentStage = "account_risk"
+				current.CurrentMessage = currentTaskTemplateMessage(result.MatchedTextOrFallback("命中账号风控"), matchedTemplate)
+			})
+			s.emitState()
+			return nil, true, meta, fmt.Errorf("account_risk:%s", result.MatchedTextOrFallback("命中账号风控"))
+		} else {
+			cache = nextCache
+		}
+
+		// Check goods_confirm
+		if matched, result, matchedTemplate, nextCache, err := s.matchStage("goods_confirm", captureBytes, cache, len(clickCapture) > 0, matchedOnceTemplates); err != nil {
+			return nil, false, matchedTemplateMeta{}, err
+		} else if matched {
+			rememberMatchedTemplate(matchedOnceTemplates, matchedTemplate)
+			goodsCapture = cloneBytes(captureBytes)
+			goodsTemplate = matchedTemplate
+			goodsFound = true
+			s.devices.UpdateCurrentTask(deviceID, func(current *device.CurrentTask) {
+				current.LastMatchedTemplate = matchedTemplate.Label
+				current.LastMatchedTemplateType = matchedTemplate.TemplateType
+				current.LastMatchedRecognitionEngine = matchedTemplate.RecognitionEngine
+				current.CurrentStage = "goods_confirm_matched"
+				current.CurrentMessage = currentTaskTemplateMessage(result.MatchedTextOrFallback("命中商品确认页"), matchedTemplate)
+			})
+			s.emitState()
+			break
+		} else {
+			cache = nextCache
+		}
+
+		s.devices.UpdateCurrentTask(deviceID, func(current *device.CurrentTask) {
+			current.CurrentStage = "loop_wait"
+			current.CurrentMessage = "未检测到商品确认页，等待下一轮"
+		})
+		s.emitState()
+		time.Sleep(time.Second)
+	}
+
+	if !goodsFound {
+		return nil, false, matchedTemplateMeta{}, fmt.Errorf("goods_confirm:未检测到商品确认页")
+	}
+
+	// ---- Step 2: Check condition_mismatch against goods_confirm capture ----
+	cache := (*vision.OCRCache)(nil)
+	s.devices.UpdateCurrentTask(deviceID, func(current *device.CurrentTask) {
+		current.CurrentStage = "condition_mismatch"
+		current.CurrentMessage = "检测条件不满足图"
+	})
+	s.emitState()
+	if matched, result, matchedTemplate, _, err := s.matchStage("condition_mismatch", goodsCapture, cache, len(clickCapture) > 0, matchedOnceTemplates); err != nil {
+		return nil, false, matchedTemplateMeta{}, err
+	} else if matched {
+		rememberMatchedTemplate(matchedOnceTemplates, matchedTemplate)
+		meta := templateMetaFromRecord(matchedTemplate)
+		s.devices.UpdateCurrentTask(deviceID, func(current *device.CurrentTask) {
+			current.LastMatchedTemplate = matchedTemplate.Label
+			current.LastMatchedTemplateType = matchedTemplate.TemplateType
+			current.LastMatchedRecognitionEngine = matchedTemplate.RecognitionEngine
+			current.CurrentStage = "condition_mismatch"
+			current.CurrentMessage = currentTaskTemplateMessage(result.MatchedTextOrFallback("命中条件不满足"), matchedTemplate)
+		})
+		s.emitState()
+		return nil, false, meta, fmt.Errorf("condition_mismatch:%s", result.MatchedTextOrFallback("条件不满足"))
+	}
+
+	// ---- Step 3: Check need_coupon against goods_confirm capture, tap if found ----
+	s.devices.UpdateCurrentTask(deviceID, func(current *device.CurrentTask) {
+		current.CurrentStage = "need_coupon"
+		current.CurrentMessage = "检测领券图"
+	})
+	s.emitState()
+	couponClicked := false
+	if matched, result, matchedTemplate, _, err := s.matchStage("need_coupon", goodsCapture, cache, len(clickCapture) > 0, matchedOnceTemplates); err != nil {
+		return nil, false, matchedTemplateMeta{}, err
+	} else if matched {
+		rememberMatchedTemplate(matchedOnceTemplates, matchedTemplate)
+		clickCapture = rememberFirstCapture(clickCapture, goodsCapture)
+		couponClicked = true
+		s.devices.UpdateCurrentTask(deviceID, func(current *device.CurrentTask) {
+			current.LastMatchedTemplate = matchedTemplate.Label
+			current.LastMatchedTemplateType = matchedTemplate.TemplateType
+			current.LastMatchedRecognitionEngine = matchedTemplate.RecognitionEngine
+			current.CurrentStage = "coupon_click_action"
+			current.CurrentMessage = currentTaskTemplateMessage(
+				fmt.Sprintf("命中领券图，执行点击 (%d,%d)", result.Center[0], result.Center[1]),
+				matchedTemplate,
+			)
+		})
+		s.emitState()
+		if err := s.devices.Tap(ctx, deviceID, result.Center[0], result.Center[1]); err != nil {
+			return nil, false, templateMetaFromRecord(matchedTemplate), fmt.Errorf("点击领券失败: %w", err)
+		}
+		sleepWithContext(ctx, durationFromSeconds(cfg.ClickImageDelaySecond))
+
+		// ---- Step 4 (conditional): Capture again after coupon click, check coupon_detail ----
+		s.devices.UpdateCurrentTask(deviceID, func(current *device.CurrentTask) {
+			current.CurrentStage = "coupon_detail"
+			current.CurrentMessage = "检测优惠券弹窗图"
+		})
+		s.emitState()
+		postCouponCapture, err := s.captureForMode(ctx, deviceID, mode)
+		if err != nil {
+			return nil, false, matchedTemplateMeta{}, fmt.Errorf("领券后截图失败: %w", err)
+		}
+		couponCapture = postCouponCapture
+
+		if matched2, _, matchedTemplate2, _, err := s.matchStage("coupon_detail", postCouponCapture, nil, len(clickCapture) > 0, matchedOnceTemplates); err != nil {
+			return nil, false, matchedTemplateMeta{}, err
+		} else if matched2 {
+			rememberMatchedTemplate(matchedOnceTemplates, matchedTemplate2)
+			s.devices.UpdateCurrentTask(deviceID, func(current *device.CurrentTask) {
+				current.LastMatchedTemplate = matchedTemplate2.Label
+				current.LastMatchedTemplateType = matchedTemplate2.TemplateType
+				current.LastMatchedRecognitionEngine = matchedTemplate2.RecognitionEngine
+				current.CurrentStage = "coupon_close"
+				current.CurrentMessage = currentTaskTemplateMessage("命中优惠券弹窗，执行关闭", matchedTemplate2)
+			})
+			s.emitState()
+			if err := s.devices.Tap(ctx, deviceID, 500, 200); err != nil {
+				return nil, false, templateMetaFromRecord(matchedTemplate2), fmt.Errorf("关闭优惠券弹窗失败: %w", err)
+			}
+			sleepWithContext(ctx, durationFromSeconds(cfg.ClickImageDelaySecond))
+		} else {
+			// coupon_detail not found after clicking coupon -- fail
+			meta := templateMetaFromRecord(matchedTemplate)
+			captures := [][]byte{}
+			if len(goodsCapture) > 0 {
+				captures = append(captures, cloneBytes(goodsCapture))
+			}
+			if len(postCouponCapture) > 0 {
+				captures = append(captures, cloneBytes(postCouponCapture))
+			}
+			_ = captures
+			return nil, false, meta, fmt.Errorf("coupon_detail:领券后未检测到优惠券弹窗")
+		}
+	}
+
+	return &verifiedFlowState{
+		goodsCapture:  goodsCapture,
+		clickCapture:  clickCapture,
+		couponCapture: couponCapture,
+		goodsTemplate: goodsTemplate,
+		couponClicked: couponClicked,
+		matchedOnce:   matchedOnceTemplates,
+	}, false, matchedTemplateMeta{}, nil
+}
+
+func (s *Service) runStealthMode(ctx context.Context, deviceID string, mode string, item clientTaskItem, cfg rt.SystemConfig) (skuExecutionResult, bool, bool, matchedTemplateMeta, error) {
+	flowState, accountRisk, meta, err := s.runSteps1to4(ctx, deviceID, mode, item, cfg)
+	if err != nil {
+		if accountRisk {
+			return skuExecutionResult{}, true, false, meta, err
+		}
+		return skuExecutionResult{}, false, false, meta, err
+	}
+
+	captures := [][]byte{cloneBytes(flowState.goodsCapture)}
+	if len(flowState.couponCapture) > 0 && len(flowState.clickCapture) > 0 {
+		captures = [][]byte{cloneBytes(flowState.clickCapture), cloneBytes(flowState.goodsCapture), cloneBytes(flowState.couponCapture)}
+	} else if len(flowState.clickCapture) > 0 {
+		captures = [][]byte{cloneBytes(flowState.clickCapture), cloneBytes(flowState.goodsCapture)}
+	}
+
+	return skuExecutionResult{
+		GoodsID:           item.GoodsID,
+		SKUID:             item.SKUID,
+		Recognition:       "goods_confirm",
+		Message:           "命中商品确认页",
+		CaptureBytes:      captures,
+		TemplateID:        flowState.goodsTemplate.ID,
+		TemplateLabel:     flowState.goodsTemplate.Label,
+		RecognitionEngine: flowState.goodsTemplate.RecognitionEngine,
+	}, false, flowState.couponClicked, templateMetaFromRecord(flowState.goodsTemplate), nil
+}
+
+func (s *Service) runDetailMode(ctx context.Context, deviceID string, mode string, item clientTaskItem, cfg rt.SystemConfig) (skuExecutionResult, bool, bool, matchedTemplateMeta, error) {
+	flowState, accountRisk, meta, err := s.runSteps1to4(ctx, deviceID, mode, item, cfg)
+	if err != nil {
+		if accountRisk {
+			return skuExecutionResult{}, true, false, meta, err
+		}
+		return skuExecutionResult{}, false, false, meta, err
+	}
+
+	// ---- Step 5: Tap spec selection at (950,950) ----
+	s.devices.UpdateCurrentTask(deviceID, func(current *device.CurrentTask) {
+		current.CurrentStage = "spec_selection_tap"
+		current.CurrentMessage = "点击规格选择区域"
+	})
+	s.emitState()
+	if err := s.devices.Tap(ctx, deviceID, 950, 950); err != nil {
+		return skuExecutionResult{}, false, false, matchedTemplateMeta{}, fmt.Errorf("规格选择点击失败: %w", err)
+	}
+	sleepWithContext(ctx, durationFromSeconds(cfg.ClickImageDelaySecond))
+
+	// ---- Step 6: Capture + OCR verify SKU names ----
+	s.devices.UpdateCurrentTask(deviceID, func(current *device.CurrentTask) {
+		current.CurrentStage = "sku_ocr_verify"
+		current.CurrentMessage = "OCR 校验 SKU 名称"
+	})
+	s.emitState()
+	skuVerifyCapture, err := s.captureForMode(ctx, deviceID, mode)
+	if err != nil {
+		return skuExecutionResult{}, false, false, matchedTemplateMeta{}, fmt.Errorf("规格选择后截图失败: %w", err)
+	}
+
+	if len(item.SKUName) > 0 {
+		ocrCache := (*vision.OCRCache)(nil)
+		for _, skuName := range item.SKUName {
+			skuName = strings.TrimSpace(skuName)
+			if skuName == "" {
+				continue
+			}
+			tempTpl := template.Record{
+				RecognitionEngine: "ocr",
+				ExpectedText:      skuName,
+				Threshold:         0.5,
+				Method:            "ocr",
+			}
+			result, nextCache, err := s.vision.Match(tempTpl, skuVerifyCapture, ocrCache)
+			if err != nil {
+				return skuExecutionResult{}, false, false, matchedTemplateMeta{}, fmt.Errorf("OCR 校验 SKU 名称 '%s' 失败: %w", skuName, err)
+			}
+			ocrCache = nextCache
+			if !result.Found {
+				resultCaptures := [][]byte{cloneBytes(flowState.goodsCapture), cloneBytes(skuVerifyCapture)}
+				return skuExecutionResult{
+					GoodsID:      item.GoodsID,
+					SKUID:        item.SKUID,
+					Recognition:  "sku_name_mismatch",
+					Message:      fmt.Sprintf("未找到 SKU 名称: %s", skuName),
+					CaptureBytes: resultCaptures,
+				}, false, flowState.couponClicked, matchedTemplateMeta{}, fmt.Errorf("sku_name_mismatch:未找到 SKU 名称 '%s'", skuName)
+			}
+		}
+	}
+
+	// ---- Success with SKU verification ----
+	captures := [][]byte{cloneBytes(flowState.goodsCapture), cloneBytes(skuVerifyCapture)}
+	if len(flowState.couponCapture) > 0 && len(flowState.clickCapture) > 0 {
+		captures = [][]byte{cloneBytes(flowState.clickCapture), cloneBytes(flowState.goodsCapture), cloneBytes(flowState.couponCapture), cloneBytes(skuVerifyCapture)}
+	} else if len(flowState.clickCapture) > 0 {
+		captures = [][]byte{cloneBytes(flowState.clickCapture), cloneBytes(flowState.goodsCapture), cloneBytes(skuVerifyCapture)}
+	}
+
+	return skuExecutionResult{
+		GoodsID:           item.GoodsID,
+		SKUID:             item.SKUID,
+		Recognition:       "goods_confirm",
+		Message:           "商品确认 + SKU 名称验证通过",
+		CaptureBytes:      captures,
+		TemplateID:        flowState.goodsTemplate.ID,
+		TemplateLabel:     flowState.goodsTemplate.Label,
+		RecognitionEngine: flowState.goodsTemplate.RecognitionEngine,
+	}, false, flowState.couponClicked, templateMetaFromRecord(flowState.goodsTemplate), nil
+}
+
+type verifiedFlowState struct {
+	goodsCapture  []byte
+	clickCapture  []byte
+	couponCapture []byte
+	goodsTemplate template.Record
+	couponClicked bool
+	matchedOnce   map[string]struct{}
+}
+
 func (s *Service) runTaskUntilTerminal(ctx context.Context, deviceID string, mode string, item clientTaskItem, cfg rt.SystemConfig) (skuExecutionResult, bool, bool, matchedTemplateMeta, error) {
 	if s.vision.Mode() == "mock" {
 		return skuExecutionResult{
@@ -2793,6 +3130,14 @@ func templateTypeDisplayName(templateType string) string {
 		return "点击图"
 	case "success_image":
 		return "成功图"
+	case "goods_confirm":
+		return "商品确认"
+	case "condition_mismatch":
+		return "条件不满足"
+	case "need_coupon":
+		return "需要领券"
+	case "coupon_detail":
+		return "优惠券弹窗"
 	default:
 		return strings.TrimSpace(templateType)
 	}

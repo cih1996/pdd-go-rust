@@ -535,6 +535,36 @@ func (d RouterDeps) handleDeviceURLTemplates(w http.ResponseWriter, r *http.Requ
 	})
 }
 
+func (d RouterDeps) handleDeviceTaskMode(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+		return
+	}
+	deviceID := strings.TrimSpace(r.PathValue("deviceId"))
+	if deviceID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing device id"})
+		return
+	}
+	var payload struct {
+		ModeEx string `json:"mode_ex"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid device task mode payload"})
+		return
+	}
+	payload.ModeEx = strings.TrimSpace(payload.ModeEx)
+	switch payload.ModeEx {
+	case "stealth", "detail":
+	default:
+		payload.ModeEx = "stealth"
+	}
+	deviceItem := d.Devices.UpdateTaskModeSelection(deviceID, payload.ModeEx)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"message": "device task mode updated",
+		"device":  deviceItem,
+	})
+}
+
 func (d RouterDeps) handleSystemConfig(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:

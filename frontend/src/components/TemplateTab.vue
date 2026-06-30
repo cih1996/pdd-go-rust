@@ -71,7 +71,8 @@ const editForm = ref({
 })
 
 const searchTemplate = ref('')
-const activeTypeTab = ref<'account_risk' | 'fail_release' | 'click_image' | 'success_image'>('account_risk')
+const activeTypeTab = ref<'account_risk' | 'fail_release' | 'click_image' | 'success_image' |
+  'goods_confirm' | 'condition_mismatch' | 'need_coupon' | 'coupon_detail'>('account_risk')
 const showCreateModal = ref(false)
 
 function openCreateModal() {
@@ -234,7 +235,7 @@ function submitTestUnsaved() {
   payload.set('recognition_engine', form.value.recognitionEngine)
   payload.set('priority', form.value.priority)
   payload.set('expected_text', form.value.expectedText)
-  payload.set('requires_click', String(form.value.requiresClick && form.value.templateType === 'fail_release'))
+  payload.set('requires_click', String(form.value.requiresClick && (form.value.templateType === 'fail_release' || form.value.templateType === 'need_coupon')))
   payload.set('match_once_per_task', String(form.value.matchOncePerTask))
   payload.set('threshold', form.value.threshold)
   payload.set('method', form.value.method)
@@ -262,6 +263,10 @@ const templatesByType = computed(() => {
     fail_release: base.filter((item) => item.template_type === 'fail_release'),
     click_image: base.filter((item) => item.template_type === 'click_image'),
     success_image: base.filter((item) => item.template_type === 'success_image'),
+    goods_confirm: base.filter((item) => item.template_type === 'goods_confirm'),
+    condition_mismatch: base.filter((item) => item.template_type === 'condition_mismatch'),
+    need_coupon: base.filter((item) => item.template_type === 'need_coupon'),
+    coupon_detail: base.filter((item) => item.template_type === 'coupon_detail'),
   }
 })
 
@@ -304,7 +309,7 @@ function submitCreate() {
   payload.set('recognition_engine', form.value.recognitionEngine)
   payload.set('priority', form.value.priority)
   payload.set('expected_text', form.value.expectedText)
-  payload.set('requires_click', String(form.value.requiresClick && form.value.templateType === 'fail_release'))
+  payload.set('requires_click', String(form.value.requiresClick && (form.value.templateType === 'fail_release' || form.value.templateType === 'need_coupon')))
   payload.set('match_once_per_task', String(form.value.matchOncePerTask))
   payload.set('threshold', form.value.threshold)
   payload.set('method', form.value.method)
@@ -468,7 +473,7 @@ function submitEdit(templateId: string) {
   payload.set('recognition_engine', editForm.value.recognitionEngine)
   payload.set('priority', editForm.value.priority)
   payload.set('expected_text', editForm.value.expectedText)
-  payload.set('requires_click', String(editForm.value.requiresClick && editForm.value.templateType === 'fail_release'))
+  payload.set('requires_click', String(editForm.value.requiresClick && (editForm.value.templateType === 'fail_release' || editForm.value.templateType === 'need_coupon')))
   payload.set('match_once_per_task', String(editForm.value.matchOncePerTask))
   payload.set('threshold', editForm.value.threshold)
   payload.set('method', editForm.value.method)
@@ -601,6 +606,18 @@ function canMove(item: TemplateRecord, direction: 'up' | 'down') {
           </div>
           <div class="tab-item" :class="{ active: activeTypeTab === 'success_image' }" @click="activeTypeTab = 'success_image'">
             成功图 <span class="badge">{{ templatesByType.success_image.length }}</span>
+          </div>
+          <div class="tab-item" :class="{ active: activeTypeTab === 'goods_confirm' }" @click="activeTypeTab = 'goods_confirm'">
+            商品确认 <span class="badge">{{ templatesByType.goods_confirm.length }}</span>
+          </div>
+          <div class="tab-item" :class="{ active: activeTypeTab === 'condition_mismatch' }" @click="activeTypeTab = 'condition_mismatch'">
+            条件不满足 <span class="badge">{{ templatesByType.condition_mismatch.length }}</span>
+          </div>
+          <div class="tab-item" :class="{ active: activeTypeTab === 'need_coupon' }" @click="activeTypeTab = 'need_coupon'">
+            需要领券 <span class="badge">{{ templatesByType.need_coupon.length }}</span>
+          </div>
+          <div class="tab-item" :class="{ active: activeTypeTab === 'coupon_detail' }" @click="activeTypeTab = 'coupon_detail'">
+            优惠券弹窗 <span class="badge">{{ templatesByType.coupon_detail.length }}</span>
           </div>
         </div>
       </div>
@@ -751,6 +768,10 @@ function canMove(item: TemplateRecord, direction: 'up' | 'down') {
                 <el-option label="失败释放" value="fail_release" />
                 <el-option label="点击图" value="click_image" />
                 <el-option label="成功图" value="success_image" />
+tt        <el-option label="商品确认" value="goods_confirm" />
+tt        <el-option label="条件不满足" value="condition_mismatch" />
+tt        <el-option label="需要领券" value="need_coupon" />
+tt        <el-option label="优惠券弹窗" value="coupon_detail" />
               </el-select>
             </el-form-item>
             <el-form-item label="识别引擎" class="flex-1">
@@ -778,7 +799,7 @@ function canMove(item: TemplateRecord, direction: 'up' | 'down') {
             <div v-if="form.recognitionEngine === 'ocr'" class="text-xs text-gray mt-1">支持 & 多条件；`!文本` 表示该文本必须不存在，例如 `店铺优惠&!领取`。</div>
           </el-form-item>
 
-          <el-form-item v-if="form.templateType === 'fail_release'" label="失败释放前置条件">
+          <el-form-item v-if="form.templateType === 'fail_release' || form.templateType === 'need_coupon'" label="失败释放前置条件">
             <label class="checkbox-label">
               <input v-model="form.requiresClick" type="checkbox" />
               <span>仅点击后参与匹配</span>
@@ -867,6 +888,10 @@ function canMove(item: TemplateRecord, direction: 'up' | 'down') {
                 <el-option label="失败释放" value="fail_release" />
                 <el-option label="点击图" value="click_image" />
                 <el-option label="成功图" value="success_image" />
+tt        <el-option label="商品确认" value="goods_confirm" />
+tt        <el-option label="条件不满足" value="condition_mismatch" />
+tt        <el-option label="需要领券" value="need_coupon" />
+tt        <el-option label="优惠券弹窗" value="coupon_detail" />
               </el-select>
             </el-form-item>
             <el-form-item label="识别引擎" class="flex-1">
@@ -894,7 +919,7 @@ function canMove(item: TemplateRecord, direction: 'up' | 'down') {
             <div v-if="editForm.recognitionEngine === 'ocr'" class="text-xs text-gray mt-1">支持 & 多条件；`!文本` 表示该文本必须不存在，例如 `店铺优惠&!领取`。</div>
           </el-form-item>
 
-          <el-form-item v-if="editForm.templateType === 'fail_release'" label="失败释放前置条件">
+          <el-form-item v-if="editForm.templateType === 'fail_release' || editForm.templateType === 'need_coupon'" label="失败释放前置条件">
             <label class="checkbox-label">
               <input v-model="editForm.requiresClick" type="checkbox" />
               <span>仅点击后参与匹配</span>
